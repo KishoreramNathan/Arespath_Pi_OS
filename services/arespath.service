@@ -1,0 +1,16 @@
+[Unit]
+Description=Arespath Rover Web Server
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/arespath_rover
+ExecStart=/usr/bin/python3 -m app.main
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

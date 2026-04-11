@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arespath Rover — Ops Console</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="shell">
+
+  <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
+  <aside class="sidebar">
+
+    <div class="brand">
+      <div class="logo"></div>
+      <div>
+        <div class="eyebrow">ARESPATH</div>
+        <h1>Ops Console</h1>
+        <p class="sub">Raspberry Pi Rover Dashboard</p>
+      </div>
+    </div>
+
+    <!-- Connection bar -->
+    <div id="conn-bar">
+      <span id="ws-pill" class="pill dim">WS</span>
+      <span>Drive <strong id="st-connected">--</strong></span>
+      <span>Lidar <strong id="st-lidar">--</strong></span>
+    </div>
+
+    <!-- System panel -->
+    <div class="panel compact">
+      <div class="panel-title">System</div>
+      <div class="status-grid">
+        <div><span>Mode</span><strong id="st-mode">--</strong></div>
+        <div><span>Safety</span><strong id="st-safety">--</strong></div>
+        <div><span>Battery</span><strong id="st-battery">--</strong></div>
+        <div><span>Mission</span><strong id="st-nav">--</strong></div>
+        <div><span>Tel Age</span><strong id="st-age">--</strong></div>
+        <div><span>Error</span><strong id="st-error">--</strong></div>
+      </div>
+      <div class="actions row">
+        <button id="armBtn" class="primary">Arm Motors</button>
+        <button id="stopBtn" class="danger">STOP</button>
+      </div>
+    </div>
+
+    <!-- Mode selector -->
+    <div class="panel compact">
+      <div class="panel-title">Modes</div>
+      <div class="segmented">
+        <button id="pilotBtn" class="secondary active">Pilot</button>
+        <button id="missionBtn" class="secondary">Mission</button>
+      </div>
+      <p class="hint">Pilot = manual drive. Mission = autonomous navigation.</p>
+    </div>
+
+    <!-- Drive controls -->
+    <div class="panel compact">
+      <div class="panel-title">Drive</div>
+      <div class="slider-label">
+        <span>Speed</span><span id="speedValue">55%</span>
+      </div>
+      <input id="speedSlider" type="range" min="5" max="100" value="55">
+      <div class="dpad">
+        <button data-cmd="forward" title="W / ▲">▲</button>
+        <button data-cmd="left"    title="A / ◀">◀</button>
+        <button data-cmd="stop"    title="Space / ■">■</button>
+        <button data-cmd="right"   title="D / ▶">▶</button>
+        <button data-cmd="back"    title="S / ▼">▼</button>
+      </div>
+      <p class="hint">Hold button or key (W A S D / Space) to drive. Release to stop.</p>
+    </div>
+
+    <!-- Map & mission -->
+    <div class="panel compact">
+      <div class="panel-title">Map + Mission</div>
+      <div class="segmented">
+        <button id="toolGoalBtn"  class="secondary active">Goal Tool</button>
+        <button id="toolStartBtn" class="secondary">Start Pose</button>
+      </div>
+      <div class="actions row top-gap">
+        <button id="mapStartBtn" class="secondary">Start Map</button>
+        <button id="mapStopBtn"  class="secondary">Stop Map</button>
+        <button id="mapResetBtn" class="secondary">Clear</button>
+      </div>
+      <div class="row gap top-gap">
+        <input id="mapName" placeholder="map name" value="floor_a">
+        <button id="saveMapBtn" class="primary">Save</button>
+      </div>
+      <div class="row gap top-gap">
+        <select id="mapSelect"></select>
+        <button id="loadMapBtn" class="secondary">Load</button>
+      </div>
+      <div class="actions row top-gap">
+        <button id="cancelNavBtn" class="secondary full">Cancel Mission</button>
+      </div>
+    </div>
+
+    <!-- Telemetry -->
+    <div class="panel compact">
+      <div class="panel-title">Telemetry</div>
+      <div class="metrics two">
+        <div><span>X</span><strong id="pose-x">0.00</strong></div>
+        <div><span>Y</span><strong id="pose-y">0.00</strong></div>
+        <div><span>Heading °</span><strong id="pose-theta">0.0</strong></div>
+        <div><span>Scan pts</span><strong id="scan-pts">0</strong></div>
+        <div><span>L RPM</span><strong id="left-rpm">0.0</strong></div>
+        <div><span>R RPM</span><strong id="right-rpm">0.0</strong></div>
+        <div><span>L PWM</span><strong id="left-pwm">0</strong></div>
+        <div><span>R PWM</span><strong id="right-pwm">0</strong></div>
+        <div><span>Path pts</span><strong id="path-pts">0</strong></div>
+        <div><span>Tool</span><strong id="tool-label">GOAL</strong></div>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ── Main viewport ────────────────────────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Hero strip -->
+    <section class="hero glass">
+      <div>
+        <div class="eyebrow">LIVE ROBOTICS VIEW</div>
+        <h2>Occupancy map, lidar scene, dual cameras, and autonomous navigation.</h2>
+        <p class="sub">Arespath Rover — Raspberry Pi + Arduino Uno + BTS7960 motor driver.</p>
+      </div>
+      <div class="hero-badges">
+        <span>20 Hz control</span>
+        <span>Lidar scene</span>
+        <span>A* planner</span>
+        <span>MJPEG video</span>
+        <span>Socket.IO</span>
+      </div>
+    </section>
+
+    <!-- Viewport panels -->
+    <section class="viewport-grid">
+
+      <!-- Scene view -->
+      <div class="panel glass scene-panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Scene View</div>
+            <div class="sub">Lidar point cloud rendered as a 3-D-style scene.</div>
+          </div>
+          <div class="legend pill-row">
+            <span><i class="lg scene"></i> cloud</span>
+            <span><i class="lg obstacle"></i> stop zone</span>
+          </div>
+        </div>
+        <canvas id="sceneCanvas" width="900" height="300"></canvas>
+      </div>
+
+      <!-- Radar -->
+      <div class="panel glass radar-panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Lidar Radar</div>
+            <div class="sub">Top-down scan centred on robot.</div>
+          </div>
+          <span id="avoidBadge" class="pill warn" style="display:none;">⚠ REROUTING</span>
+        </div>
+        <canvas id="radarCanvas" width="380" height="380"></canvas>
+      </div>
+
+      <!-- Mission map -->
+      <div class="panel glass map-panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Mission Map</div>
+            <div class="sub">Occupancy grid, robot pose, path, and navigation goal.</div>
+          </div>
+          <div class="legend pill-row">
+            <span><i class="lg free"></i> free</span>
+            <span><i class="lg occ"></i> occ</span>
+            <span><i class="lg scan"></i> lidar</span>
+            <span><i class="lg path"></i> path</span>
+          </div>
+        </div>
+        <canvas id="mapCanvas" width="820" height="820"></canvas>
+        <div class="map-help">Click to place goal. In Start Pose mode: click + drag to set heading.</div>
+      </div>
+
+      <!-- ── Vision panel ──────────────────────────────────────────────────── -->
+      <div class="panel glass cameras-panel">
+
+        <!-- Header -->
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Vision</div>
+            <div class="sub">Live MJPEG · Snapshots · Photos</div>
+          </div>
+        </div>
+
+        <!-- Live streams -->
+        <div class="camera-grid">
+          <div class="cam-card">
+            <div class="cam-label">Front</div>
+            <img id="frontCam" src="/video/front" alt="front">
+          </div>
+          <div class="cam-card">
+            <div class="cam-label">Rear</div>
+            <img id="rearCam" src="/video/rear" alt="rear">
+          </div>
+        </div>
+
+        <!-- ── Snapshot ring-buffer section ─────────────────────────────── -->
+        <div class="vision-section">
+          <div class="vision-section-title">Auto Snapshots <span class="hint-inline">(ring-buffer, max 10 per camera, every 10 s)</span></div>
+          <div class="vision-actions">
+            <button id="snapToggleBtn" class="secondary">📷 Start Snapshots</button>
+            <span class="snap-count-badge">F:<strong id="snapCountFront">0</strong> R:<strong id="snapCountRear">0</strong></span>
+            <button id="viewSnapshotsBtn" class="secondary">🖼 View Snapshots</button>
+          </div>
+        </div>
+
+        <!-- ── Permanent photo section ───────────────────────────────────── -->
+        <div class="vision-section">
+          <div class="vision-section-title">Permanent Photos <span class="hint-inline">(saved forever, both cameras)</span></div>
+          <div class="vision-actions">
+            <button id="takePhotoBtn" class="primary">📸 Take Photo</button>
+            <span id="photoFeedback" class="hint-inline"></span>
+            <button id="viewPhotosBtn" class="secondary">🗂 View Photos</button>
+          </div>
+        </div>
+
+      </div><!-- /cameras-panel -->
+
+    </section>
+  </main>
+</div>
+
+<!-- ── Snapshot Gallery Modal ──────────────────────────────────────────────── -->
+<div id="modalOverlay" class="modal-overlay" style="display:none;">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" id="modalTitle">Gallery</div>
+        <div class="sub" id="modalSub"></div>
+      </div>
+      <button class="modal-close" id="modalClose">✕</button>
+    </div>
+    <div class="modal-tabs" id="modalTabs" style="display:none;">
+      <button class="modal-tab active" data-tab="front">Front</button>
+      <button class="modal-tab" data-tab="rear">Rear</button>
+      <button class="modal-tab" data-tab="all">All</button>
+    </div>
+    <div class="modal-gallery" id="modalGallery">
+      <div class="modal-empty">Loading…</div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
