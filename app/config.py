@@ -30,11 +30,10 @@ WHEEL_BASE_M   = 0.400        # centre-to-centre wheel track (matches WHEEL_TRAC
 #   Common gear ratios: 10:1, 20:1, 25:1, 30:1, 34:1, 50:1, 75:1
 #   ► Change MOTOR_GEAR_RATIO to match your specific motor variant.
 ENCODER_MODEL       = "OE-37"
-ENCODER_PPR         = 11       # pulses per motor revolution (OE-37 datasheet)
-ENCODER_QUADRATURE  = 4        # 4× quadrature decoding
-MOTOR_GEAR_RATIO    = 30.0     # ← set this to your gearbox ratio
+ENCODER_PPR         = 7       # pulses per motor revolution (OE-37 datasheet)
+ENCODER_QUADRATURE  = 4       # 4× quadrature decoding
+MOTOR_GEAR_RATIO    = 50.9     # ← set this to your gearbox ratio
 TICKS_PER_WHEEL_REV = float(ENCODER_PPR * ENCODER_QUADRATURE * MOTOR_GEAR_RATIO)
-# = 1320 counts/rev at 30:1  |  1496 at 34:1  |  3300 at 75:1
 
 # ── Drive limits ──────────────────────────────────────────────────────────────
 MAX_PWM = 180                  # maximum PWM value sent to Arduino
