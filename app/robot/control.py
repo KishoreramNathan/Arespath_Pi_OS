@@ -22,7 +22,7 @@ from app.robot.command_bus import DriveCommandQueue
 from app.robot.lidar import LidarLocalizer, LidarManager
 from app.robot.mapping import OccupancyGridMap
 from app.robot.poi import PoiManager
-from app.robot.planner import astar, inflate_occupancy, simplify_path
+from app.robot.planner import astar, inflate_occupancy, nearest_free_cell, simplify_path
 from app.robot.serial_bridge import ArduinoBridge
 from app.robot.state import NavigationState, Pose, RobotState, wrap_angle
 
@@ -55,8 +55,9 @@ class RobotRuntime:
         self._last_heartbeat: float = time.time()
 
         # Obstacle avoidance recovery state
-        self._obstacle_reverse_until: float = 0.0   # time.time() deadline for reverse
-        self._obstacle_blocked_at:    float = 0.0   # when we first got blocked
+        self._obstacle_reverse_until: float = 0.0   # deadline for reverse phase
+        self._obstacle_blocked_at:    float = 0.0   # when obstacle was first detected
+        self._replanning_after_obs:   bool  = False  # True while following the post-obstacle replan
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -192,7 +193,10 @@ class RobotRuntime:
         with self.lock:
             self.map.clear()
             self.state.nav.path = []
-        self.localizer.reset()   # reset ICP reference so stale scan doesn't corrupt new map
+        self.localizer.reset()
+        self._replanning_after_obs   = False
+        self._obstacle_blocked_at    = 0.0
+        self._obstacle_reverse_until = 0.0
 
     def save_map(self, name: str) -> dict:
         return self.map.save(name)
@@ -208,7 +212,10 @@ class RobotRuntime:
             self._last_ticks = None
             self._last_tel_ts = None
             self.state.nav.status = "start pose updated"
-        self.localizer.reset()   # new pose → drop old ICP reference
+        self.localizer.reset()
+        self._replanning_after_obs   = False
+        self._obstacle_blocked_at    = 0.0
+        self._obstacle_reverse_until = 0.0
 
     # ── POI / waypoint API (delegates to PoiManager) ─────────────────────────
 
@@ -492,36 +499,47 @@ class RobotRuntime:
             self.queue.push_stop()
             self.state.nav.status = "waiting for arm"
             return
+
         goal = self.state.nav.goal
         if goal is None:
             self._cancel_nav_locked()
             return
-        dist_to_goal = math.hypot(goal[0] - self.state.pose.x, goal[1] - self.state.pose.y)
+
+        dist_to_goal = math.hypot(
+            goal[0] - self.state.pose.x, goal[1] - self.state.pose.y
+        )
         if dist_to_goal <= config.GOAL_TOLERANCE_M:
             self.queue.push_stop()
-            self.state.nav.status = "goal reached"
-            self.state.nav.active = False
-            self.state.linear_cmd = 0.0
+            self.state.nav.status  = "goal reached"
+            self.state.nav.active  = False
+            self.state.linear_cmd  = 0.0
             self.state.angular_cmd = 0.0
+            self._obstacle_blocked_at    = 0.0
             self._obstacle_reverse_until = 0.0
+            self._replanning_after_obs   = False
             return
 
         now = time.time()
 
-        # ══ Obstacle handling — 5-second patience → back-up → forced replan ══
+        # ══════════════════════════════════════════════════════════════════════
+        # Obstacle state machine
+        # ──────────────────────────────────────────────────────────────────────
+        # Phase 1  [0 … OBSTACLE_WAIT_BEFORE_REPLAN_S]:
+        #   Stop and wait.  If obstacle clears naturally → resume immediately.
         #
-        #  Phase 1  (0 – OBSTACLE_WAIT_BEFORE_REPLAN_S):
-        #    Stop and wait.  Rover holds position; if the obstacle moves away
-        #    the nav loop resumes automatically via the "cleared" block below.
+        # Phase 2  [patience expired]:
+        #   Brief reverse so the rover's body exits the stop zone.
         #
-        #  Phase 2  (after patience expires):
-        #    Brief reverse (OBSTACLE_REPLAN_REVERSE_S) to clear the stop zone.
+        # Phase 3  [reverse done]:
+        #   Stamp the obstacle into the occupancy map, set _replanning_after_obs,
+        #   and RETURN.  The next tick will drop into normal-nav and replan.
         #
-        #  Phase 3:
-        #    Force an immediate A* replan.  The live scan is stamped into the
-        #    map so the planner sees the obstacle and routes around it.
-        # ─────────────────────────────────────────────────────────────────────
-        if self.state.obstacle_stop:
+        # Guard: _replanning_after_obs skips the wait loop so the rover can
+        #   follow the newly planned path even if obstacle_stop is momentarily
+        #   still True (it clears within 1–2 ticks as the rover moves away).
+        # ══════════════════════════════════════════════════════════════════════
+        if self.state.obstacle_stop and not self._replanning_after_obs:
+            # ── Record first detection time ───────────────────────────────────
             if self._obstacle_blocked_at == 0.0:
                 self._obstacle_blocked_at = now
                 log.info(
@@ -532,69 +550,72 @@ class RobotRuntime:
             elapsed = now - self._obstacle_blocked_at
             wait_s  = config.OBSTACLE_WAIT_BEFORE_REPLAN_S
 
+            # ── Phase 1: hold still, show countdown ──────────────────────────
             if elapsed < wait_s:
-                # ── Phase 1: patience window — hold still, show countdown ────
                 self.queue.push_stop()
                 remaining = wait_s - elapsed
-                self.state.nav.status = f"obstacle: waiting {remaining:.0f} s"
+                self.state.nav.status  = f"obstacle: waiting {remaining:.0f} s"
                 self.state.linear_cmd  = 0.0
                 self.state.angular_cmd = 0.0
                 return
 
-            # ── Phase 2: patience expired — reverse briefly ──────────────────
+            # ── Phase 2: arm the reverse timer ────────────────────────────────
             if self._obstacle_reverse_until == 0.0:
-                rev_dur = config.OBSTACLE_REPLAN_REVERSE_S
-                self._obstacle_reverse_until = now + rev_dur
+                self._obstacle_reverse_until = now + config.OBSTACLE_REPLAN_REVERSE_S
                 log.info(
-                    "Obstacle still present after %.0f s — reversing %.1f s then replanning",
-                    wait_s, rev_dur,
+                    "Obstacle still present after %.0f s — reversing %.1f s",
+                    wait_s, config.OBSTACLE_REPLAN_REVERSE_S,
                 )
 
             if now < self._obstacle_reverse_until:
-                rev_speed = config.OBSTACLE_REVERSE_SPEED
-                left_pwm, right_pwm = self._cmd_to_pwm(rev_speed, 0.0)
-                self.queue.push_nav(left_pwm, right_pwm)
+                lp, rp = self._cmd_to_pwm(config.OBSTACLE_REVERSE_SPEED, 0.0)
+                self.queue.push_nav(lp, rp)
                 self.state.nav.status  = "obstacle: reversing to replan"
-                self.state.linear_cmd  = rev_speed
+                self.state.linear_cmd  = config.OBSTACLE_REVERSE_SPEED
                 self.state.angular_cmd = 0.0
                 return
 
-            # ── Phase 3: reverse done — stamp obstacle in map → forced replan
-            log.info("Forcing replan around persistent obstacle")
-            # Mark obstacle cells even if mapping is off, so A* avoids it
+            # ── Phase 3: reverse done — stamp scan, arm replan, RETURN ────────
+            #   *** The critical fix: RETURN here instead of falling through. ***
+            #   Falling through caused _obstacle_blocked_at to be re-set to `now`
+            #   on the very next tick (obstacle still in cone), restarting the
+            #   5-second wait and preventing the A* plan from ever running.
+            log.info("Reverse done — stamping obstacle into map and replanning")
             if scan:
                 self.map.update_from_scan(self.state.pose, scan)
             self._obstacle_blocked_at    = 0.0
             self._obstacle_reverse_until = 0.0
-            self.state.nav.last_plan_time = 0.0   # trigger immediate replan
+            self._replanning_after_obs   = True   # skip wait loop next tick
+            self.state.nav.last_plan_time = 0.0   # force immediate replan
             self.state.nav.path          = []
             self.state.nav.status        = "replanning around obstacle"
-            # Fall through to normal nav so the plan runs this tick
-        # ─────────────────────────────────────────────────────────────────────
+            return  # ← RETURN: planner fires on the next tick
 
-        # ── Obstacle cleared before patience expired ──────────────────────────
+        # ── Obstacle cleared naturally (before patience expired) ──────────────
         if self._obstacle_blocked_at != 0.0:
             elapsed = now - self._obstacle_blocked_at
             log.info("Obstacle cleared after %.1f s — resuming path", elapsed)
             self._obstacle_blocked_at    = 0.0
             self._obstacle_reverse_until = 0.0
-            # Force one replan so the robot gets a fresh path from its new position
-            self.state.nav.last_plan_time = 0.0
+            self._replanning_after_obs   = False
+            self.state.nav.last_plan_time = 0.0   # fresh plan from new pose
             self.state.nav.path          = []
 
-        # ── Normal navigation ──────────────────────────────────────────────────
+        # ── Normal navigation ─────────────────────────────────────────────────
         should_plan = (
             not self.state.nav.path
-            or self.state.nav.status == "planning"
+            or self._replanning_after_obs
             or (now - self.state.nav.last_plan_time) > config.NAV_REPLAN_SECONDS
         )
         if should_plan:
-            # Sync live scan into the map before planning so new obstacles are visible
-            if scan and self.state.mapping:
+            # Always stamp the current scan before planning so the map has
+            # the latest obstacle information (critical for post-obstacle replan).
+            if scan:
                 self.map.update_from_scan(self.state.pose, scan)
             self._plan_path()
+            self._replanning_after_obs = False   # clear whether or not plan succeeded
             if not self.state.nav.path:
-                self.state.nav.status = "no path"
+                self.state.nav.status = "no path — obstacle blocking route"
                 self.queue.push_stop()
                 return
 
@@ -610,21 +631,44 @@ class RobotRuntime:
         self.state.linear_cmd  = linear
         self.state.angular_cmd = angular
         self.state.nav.status  = "following path"
-        left_pwm, right_pwm = self._cmd_to_pwm(linear, angular)
-        self.queue.push_nav(left_pwm, right_pwm)
+        lp, rp = self._cmd_to_pwm(linear, angular)
+        self.queue.push_nav(lp, rp)
 
     def _plan_path(self) -> None:
-        occ = self.map.occupancy_for_planner()
-        occ = inflate_occupancy(occ, config.PLANNER_INFLATION_CELLS)
-        start = self.map.world_to_grid(self.state.pose.x, self.state.pose.y)
-        goal  = self.map.world_to_grid(self.state.nav.goal[0], self.state.nav.goal[1])
-        cells = astar(occ, start, goal)
+        """Run A* from current pose to goal.
+
+        If the rover's grid cell (or the goal cell) falls inside an inflated
+        obstacle zone — which can happen when the rover backed up into a cell
+        that was stamped occupied — nearest_free_cell() finds the closest
+        unblocked cell so A* is never given an occupied start/goal.
+        """
+        occ     = self.map.occupancy_for_planner()
+        occ_inf = inflate_occupancy(occ, config.PLANNER_INFLATION_CELLS)
+
+        start_raw = self.map.world_to_grid(self.state.pose.x, self.state.pose.y)
+        goal_raw  = self.map.world_to_grid(
+            self.state.nav.goal[0], self.state.nav.goal[1]
+        )
+
+        # Nudge start/goal to nearest free cell if inflation overlaps them
+        start = nearest_free_cell(occ_inf, start_raw, radius=8)
+        goal  = nearest_free_cell(occ_inf, goal_raw,  radius=8)
+
+        if start is None or goal is None:
+            log.warning("_plan_path: start or goal surrounded by obstacles")
+            self.state.nav.path = []
+            self.state.nav.last_plan_time = time.time()
+            return
+
+        cells = astar(occ_inf, start, goal)
         self.state.nav.last_plan_time = time.time()
         if not cells:
+            log.warning("_plan_path: A* found no path from %s to %s", start, goal)
             self.state.nav.path = []
             return
         world = [self.map.grid_to_world(x, y) for x, y in cells]
         self.state.nav.path = simplify_path(world)
+        log.info("_plan_path: new path with %d waypoints", len(self.state.nav.path))
 
     def _lookahead_point(self) -> Tuple[float, float]:
         pose = self.state.pose

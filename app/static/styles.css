@@ -611,3 +611,34 @@ button.full { width: 100%; }
   50%       { opacity: 0.55; }
 }
 .nav-waiting { animation: navWait 1s ease-in-out infinite; }
+
+/* ── Rover Specs panel ─────────────────────────────────────────────────────── */
+.rover-specs-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.rs-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+}
+.rs-label {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  margin-right: 6px;
+}
+.rs-val {
+  font-size: 11px;
+  color: var(--accent);
+  font-family: monospace;
+  text-align: right;
+}

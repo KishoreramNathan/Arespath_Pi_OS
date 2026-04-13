@@ -12,16 +12,53 @@ import numpy as np
 
 
 def inflate_occupancy(occupancy: np.ndarray, radius: int) -> np.ndarray:
-    """Grow every occupied cell by *radius* cells (obstacle inflation)."""
+    """Grow every occupied cell by *radius* cells using fast numpy convolution."""
     if radius <= 0:
         return occupancy.copy()
+    # Build a square structuring element and use max-pooling via conv
+    d = 2 * radius + 1
+    kernel = np.ones((d, d), dtype=np.float32)
+    from numpy.lib.stride_tricks import sliding_window_view  # numpy ≥ 1.20
+    try:
+        # Pad the map, then compute the max in each (d×d) window
+        padded = np.pad(occupancy.astype(np.float32), radius, mode="constant", constant_values=0)
+        windows = sliding_window_view(padded, (d, d))
+        return (windows.max(axis=(-2, -1)) > 0).astype(np.uint8)
+    except Exception:
+        # Fallback: simple Python loop (works on any numpy version)
+        h, w = occupancy.shape
+        out = occupancy.copy()
+        for y, x in np.argwhere(occupancy > 0):
+            y0, y1 = max(0, y - radius), min(h, y + radius + 1)
+            x0, x1 = max(0, x - radius), min(w, x + radius + 1)
+            out[y0:y1, x0:x1] = 1
+        return out
+
+
+def nearest_free_cell(
+    occupancy: np.ndarray,
+    cell: Tuple[int, int],
+    radius: int = 10,
+) -> Optional[Tuple[int, int]]:
+    """Return *cell* if free, else the nearest free cell within *radius*, else None.
+
+    This lets the planner start/end outside a cell that became occupied due to
+    obstacle inflation (e.g. rover backed up but the map stamp overlaps its pose).
+    """
+    gx, gy = cell
     h, w = occupancy.shape
-    out = occupancy.copy()
-    for y, x in np.argwhere(occupancy > 0):
-        y0, y1 = max(0, y - radius), min(h, y + radius + 1)
-        x0, x1 = max(0, x - radius), min(w, x + radius + 1)
-        out[y0:y1, x0:x1] = 1
-    return out
+    if 0 <= gx < w and 0 <= gy < h and not occupancy[gy, gx]:
+        return cell
+    best: Optional[Tuple[int, int]] = None
+    best_d = float("inf")
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            nx, ny = gx + dx, gy + dy
+            if 0 <= nx < w and 0 <= ny < h and not occupancy[ny, nx]:
+                d = math.hypot(dx, dy)
+                if d < best_d:
+                    best_d, best = d, (nx, ny)
+    return best
 
 
 def astar(
