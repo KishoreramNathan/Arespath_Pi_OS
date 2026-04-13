@@ -18,9 +18,23 @@ SNAPSHOT_DIR.mkdir(exist_ok=True, parents=True)
 PHOTOS_DIR.mkdir(exist_ok=True, parents=True)
 
 # ── Robot geometry ────────────────────────────────────────────────────────────
-WHEEL_RADIUS_M = 0.050        # metres — measure your real wheel
-WHEEL_BASE_M = 0.260          # centre-to-centre distance between wheels
-TICKS_PER_WHEEL_REV = 420.0   # encoder counts per full wheel revolution
+WHEEL_RADIUS_M = 0.060        # metres — half of 120 mm wheel diameter
+WHEEL_BASE_M   = 0.400        # centre-to-centre wheel track (matches WHEEL_TRACK_M)
+
+# ── OE-37 Encoder ─────────────────────────────────────────────────────────────
+# The OE-37 is a magnetic quadrature encoder fitted on 37 mm gearmotors.
+# It produces 11 pulses per revolution (PPR) on the motor shaft.
+# Quadrature decoding (4× mode) gives 44 counts per motor revolution.
+# Multiply by the gearbox ratio to get counts per wheel revolution.
+#
+#   Common gear ratios: 10:1, 20:1, 25:1, 30:1, 34:1, 50:1, 75:1
+#   ► Change MOTOR_GEAR_RATIO to match your specific motor variant.
+ENCODER_MODEL       = "OE-37"
+ENCODER_PPR         = 11       # pulses per motor revolution (OE-37 datasheet)
+ENCODER_QUADRATURE  = 4        # 4× quadrature decoding
+MOTOR_GEAR_RATIO    = 30.0     # ← set this to your gearbox ratio
+TICKS_PER_WHEEL_REV = float(ENCODER_PPR * ENCODER_QUADRATURE * MOTOR_GEAR_RATIO)
+# = 1320 counts/rev at 30:1  |  1496 at 34:1  |  3300 at 75:1
 
 # ── Drive limits ──────────────────────────────────────────────────────────────
 MAX_PWM = 180                  # maximum PWM value sent to Arduino
@@ -119,7 +133,8 @@ LIDAR_ICP_MIN_POINTS       = 30     # skip ICP if scan has fewer than this many 
 LIDAR_ICP_INTERVAL_S       = 0.15   # run ICP at most this often (seconds)
 
 # ── POI / Waypoint features ───────────────────────────────────────────────────
-POIS_FILE = DATA_DIR / "pois.json"   # persistent store for points of interest
+POIS_FILE             = DATA_DIR / "pois.json"              # persistent store for points of interest
+RUNTIME_SETTINGS_FILE = DATA_DIR / "runtime_settings.json"  # live-tunable params (UI → disk)
 
 # ── Web server ────────────────────────────────────────────────────────────────
 WEB_PORT = 8080

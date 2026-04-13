@@ -1196,3 +1196,110 @@ setInterval(refreshMapList, 10000);
 
 // Initialise map canvas cursor and tool hint
 setTool('goal');
+
+// ── Live Tuning panel ─────────────────────────────────────────────────────────
+const EL_tuningRows     = document.getElementById('tuning-rows');
+const EL_tuningFeedback = document.getElementById('tuning-feedback');
+const EL_tuningReset    = document.getElementById('tuningResetBtn');
+
+let _tuningSettings = {};   // cache: key → {value, min, max, label, unit, default}
+
+async function loadTuningSettings() {
+  try {
+    const data = await api('/api/settings');
+    _tuningSettings = data.settings || {};
+    renderTuningRows();
+  } catch (e) {
+    if (EL_tuningRows) EL_tuningRows.innerHTML = `<div class="hint">Error: ${e.message}</div>`;
+  }
+}
+
+function renderTuningRows() {
+  if (!EL_tuningRows) return;
+  EL_tuningRows.innerHTML = '';
+  Object.entries(_tuningSettings).forEach(([key, spec]) => {
+    const row = document.createElement('div');
+    row.className = 'tuning-row';
+
+    const lbl = document.createElement('div');
+    lbl.className = 'tuning-label';
+    lbl.title = spec.description || '';
+    lbl.textContent = spec.label;
+
+    const unit = document.createElement('span');
+    unit.className = 'tuning-unit';
+    unit.textContent = spec.unit ? ` ${spec.unit}` : '';
+
+    const inp = document.createElement('input');
+    inp.type      = 'number';
+    inp.className = 'tuning-input';
+    inp.min       = spec.min;
+    inp.max       = spec.max;
+    inp.step      = spec.unit === 'm' || spec.unit === 'm/s' ? '0.01'
+                  : spec.unit === 's' ? '0.5'
+                  : '0.05';
+    inp.value     = Number(spec.value).toFixed(
+      spec.unit === 's' ? 1 : 2
+    );
+    inp.dataset.key     = key;
+    inp.dataset.default = spec.default;
+
+    // Changed indicator dot
+    const dot = document.createElement('span');
+    dot.className = 'tuning-dot';
+    dot.style.visibility = Math.abs(spec.value - spec.default) > 0.0001 ? 'visible' : 'hidden';
+    dot.title = `Default: ${spec.default} ${spec.unit}`;
+
+    // Apply on Enter or blur
+    const applyFn = async () => {
+      const val = parseFloat(inp.value);
+      if (isNaN(val)) return;
+      try {
+        const r = await api('/api/settings', 'PATCH', { key, value: val });
+        if (r.ok) {
+          _tuningSettings[key].value = r.value;
+          inp.value = Number(r.value).toFixed(inp.step.includes('0.5') ? 1 : 2);
+          dot.style.visibility = Math.abs(r.value - spec.default) > 0.0001 ? 'visible' : 'hidden';
+          _flashFeedback(`✓ ${spec.label} = ${r.value} ${spec.unit}`, 'ok');
+        }
+      } catch (err) {
+        _flashFeedback(`✗ ${err.message}`, 'err');
+        inp.value = Number(_tuningSettings[key].value).toFixed(inp.step.includes('0.5') ? 1 : 2);
+      }
+    };
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); applyFn(); } });
+    inp.addEventListener('blur', applyFn);
+
+    const ctrl = document.createElement('div');
+    ctrl.className = 'tuning-ctrl';
+    ctrl.appendChild(inp);
+    ctrl.appendChild(unit);
+    ctrl.appendChild(dot);
+
+    row.appendChild(lbl);
+    row.appendChild(ctrl);
+    EL_tuningRows.appendChild(row);
+  });
+}
+
+function _flashFeedback(msg, type) {
+  if (!EL_tuningFeedback) return;
+  EL_tuningFeedback.textContent = msg;
+  EL_tuningFeedback.className = `tuning-feedback ${type}`;
+  clearTimeout(EL_tuningFeedback._t);
+  EL_tuningFeedback._t = setTimeout(() => {
+    EL_tuningFeedback.textContent = '';
+    EL_tuningFeedback.className = 'tuning-feedback';
+  }, 3000);
+}
+
+EL_tuningReset && EL_tuningReset.addEventListener('click', async () => {
+  if (!confirm('Reset all tuning values to defaults?')) return;
+  try {
+    const r = await api('/api/settings', 'DELETE');
+    if (r.ok) { _tuningSettings = r.settings; renderTuningRows(); _flashFeedback('✓ Reset to defaults', 'ok'); }
+  } catch (e) { _flashFeedback(`✗ ${e.message}`, 'err'); }
+});
+
+// Load tuning on startup
+loadTuningSettings();

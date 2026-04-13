@@ -16,6 +16,7 @@ Routes
   /api/lidar              → GET lidar data + avoidance route
   /api/map/data           → GET map payload
   /api/map/list           → GET saved map names
+  /api/settings           → GET all tunables | PATCH {key,value} | DELETE (reset)
   /api/cameras            → GET snapshot status + file lists
   /api/snapshot/start     → POST — begin ring-buffer capture
   /api/snapshot/stop      → POST — end ring-buffer capture
@@ -42,6 +43,11 @@ from flask_socketio import SocketIO, emit
 from app import config
 from app.robot.camera import CameraManager
 from app.robot.control import RobotRuntime
+from app.robot import runtime_cfg as _runtime_cfg_mod
+
+# Initialise runtime settings BEFORE RobotRuntime so rtcfg singleton is ready
+_runtime_cfg_mod.init(config.RUNTIME_SETTINGS_FILE)
+from app.robot.runtime_cfg import rtcfg  # noqa: E402 (after init)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,6 +169,39 @@ def api_nav_goal():
 def api_nav_cancel():
     runtime.cancel_navigation()
     return jsonify({"ok": True})
+
+
+# ── Runtime settings (tunable parameters) ────────────────────────────────────
+
+@app.route("/api/settings", methods=["GET"])
+def api_settings_get():
+    """Return all tunables with current values, defaults, min/max, units."""
+    return jsonify({"settings": rtcfg.all()})
+
+
+@app.route("/api/settings", methods=["PATCH"])
+def api_settings_patch():
+    """Update one tunable parameter.  Body: {key: str, value: float}."""
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "JSON body required"}), 400
+    key = request.json.get("key")
+    val = request.json.get("value")
+    if key is None or val is None:
+        return jsonify({"ok": False, "error": "key and value required"}), 400
+    try:
+        stored = rtcfg.set(key, float(val))
+        return jsonify({"ok": True, "key": key, "value": stored})
+    except KeyError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.route("/api/settings", methods=["DELETE"])
+def api_settings_reset():
+    """Reset all tunable parameters to config.py defaults."""
+    rtcfg.reset_to_defaults()
+    return jsonify({"ok": True, "settings": rtcfg.all()})
 
 
 # ── POI / Waypoint routes ─────────────────────────────────────────────────────

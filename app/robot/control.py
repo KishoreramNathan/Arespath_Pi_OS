@@ -23,6 +23,7 @@ from app.robot.lidar import LidarLocalizer, LidarManager
 from app.robot.mapping import OccupancyGridMap
 from app.robot.poi import PoiManager
 from app.robot.planner import astar, inflate_occupancy, nearest_free_cell, simplify_path
+from app.robot.runtime_cfg import rtcfg
 from app.robot.serial_bridge import ArduinoBridge
 from app.robot.state import NavigationState, Pose, RobotState, wrap_angle
 
@@ -251,7 +252,7 @@ class RobotRuntime:
         # Obstacle countdown (seconds remaining before forced replan)
         if self._obstacle_blocked_at > 0:
             elapsed   = time.time() - self._obstacle_blocked_at
-            remaining = max(0.0, config.OBSTACLE_WAIT_BEFORE_REPLAN_S - elapsed)
+            remaining = max(0.0, rtcfg.get("obstacle_wait_before_replan_s") - elapsed)
             s["obstacle_wait_remaining_s"] = round(remaining, 1)
         else:
             s["obstacle_wait_remaining_s"] = None
@@ -293,7 +294,7 @@ class RobotRuntime:
             if dist <= 0:
                 continue
             norm_angle = math.atan2(math.sin(angle), math.cos(angle))  # wrap to ±π
-            if abs(norm_angle) < cone and dist < config.OBSTACLE_STOP_DISTANCE_M * 3.0:
+            if abs(norm_angle) < cone and dist < rtcfg.get("obstacle_stop_distance_m") * 3.0:
                 if dist < nearest_dist:
                     nearest_dist  = dist
                     nearest_angle = norm_angle
@@ -484,7 +485,7 @@ class RobotRuntime:
     def _obstacle_in_cone(self, scan: List[Tuple[float, float]]) -> bool:
         cone = math.radians(25)
         for angle, dist in scan:
-            if abs(angle) < cone and dist < config.OBSTACLE_STOP_DISTANCE_M:
+            if abs(angle) < cone and dist < rtcfg.get("obstacle_stop_distance_m"):
                 return True
         return False
 
@@ -544,11 +545,11 @@ class RobotRuntime:
                 self._obstacle_blocked_at = now
                 log.info(
                     "Obstacle detected — waiting %.0f s before replanning",
-                    config.OBSTACLE_WAIT_BEFORE_REPLAN_S,
+                    rtcfg.get("obstacle_wait_before_replan_s"),
                 )
 
             elapsed = now - self._obstacle_blocked_at
-            wait_s  = config.OBSTACLE_WAIT_BEFORE_REPLAN_S
+            wait_s  = rtcfg.get("obstacle_wait_before_replan_s")
 
             # ── Phase 1: hold still, show countdown ──────────────────────────
             if elapsed < wait_s:
@@ -561,10 +562,10 @@ class RobotRuntime:
 
             # ── Phase 2: arm the reverse timer ────────────────────────────────
             if self._obstacle_reverse_until == 0.0:
-                self._obstacle_reverse_until = now + config.OBSTACLE_REPLAN_REVERSE_S
+                self._obstacle_reverse_until = now + rtcfg.get("obstacle_replan_reverse_s")
                 log.info(
                     "Obstacle still present after %.0f s — reversing %.1f s",
-                    wait_s, config.OBSTACLE_REPLAN_REVERSE_S,
+                    wait_s, rtcfg.get("obstacle_replan_reverse_s"),
                 )
 
             if now < self._obstacle_reverse_until:
@@ -605,7 +606,7 @@ class RobotRuntime:
         should_plan = (
             not self.state.nav.path
             or self._replanning_after_obs
-            or (now - self.state.nav.last_plan_time) > config.NAV_REPLAN_SECONDS
+            or (now - self.state.nav.last_plan_time) > rtcfg.get("nav_replan_seconds")
         )
         if should_plan:
             # Always stamp the current scan before planning so the map has
@@ -685,7 +686,7 @@ class RobotRuntime:
         return path[-1]
 
     def _cmd_to_pwm(self, linear: float, angular: float) -> Tuple[int, int]:
-        lmps = linear  * config.MAX_LINEAR_MPS
+        lmps = linear  * rtcfg.get("max_linear_mps")
         rads = angular * config.MAX_ANGULAR_RADPS
         # Differential drive: turn left → right wheel faster, left wheel slower
         # angular > 0 means turn left: left PWM decreases, right PWM increases

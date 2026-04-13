@@ -125,6 +125,10 @@
           <span class="rs-val">520 × 500 × 300 mm</span>
         </div>
         <div class="rs-row">
+          <span class="rs-label">Encoder</span>
+          <span class="rs-val">OE-37 · 11 PPR · 4×</span>
+        </div>
+        <div class="rs-row">
           <span class="rs-label">Wheel ⌀</span>
           <span class="rs-val">120 mm</span>
         </div>
@@ -141,18 +145,22 @@
           <span class="rs-val">centred</span>
         </div>
         <div class="rs-row">
-          <span class="rs-label">Stop zone</span>
-          <span class="rs-val">35 cm</span>
-        </div>
-        <div class="rs-row">
-          <span class="rs-label">Replan wait</span>
-          <span class="rs-val">5 s</span>
-        </div>
-        <div class="rs-row">
           <span class="rs-label">Map</span>
           <span class="rs-val">48 m × 48 m</span>
         </div>
       </div>
+    </div>
+
+    <!-- Live tuning panel -->
+    <div class="panel compact">
+      <div class="panel-title">
+        Live Tuning
+        <button id="tuningResetBtn" class="secondary icon-btn tuning-reset" title="Reset all to defaults">↺</button>
+      </div>
+      <div id="tuning-rows" class="tuning-rows">
+        <div class="hint">Loading…</div>
+      </div>
+      <div id="tuning-feedback" class="tuning-feedback"></div>
     </div>
 
     <div class="panel compact">
