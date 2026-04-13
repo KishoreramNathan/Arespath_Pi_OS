@@ -156,3 +156,147 @@ class LidarManager:
                 self._scan = points
             t += 0.15
             time.sleep(0.17)   # ~6 Hz mock update
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LiDAR-based pose correction (lightweight 2-D ICP)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import numpy as np  # noqa: E402  (already imported above via math/time)
+
+
+class LidarLocalizer:
+    """Point-to-point ICP that corrects odometry on slippery surfaces.
+
+    Usage::
+
+        localizer = LidarLocalizer()
+        corrected_pose = localizer.correct(odom_pose, current_scan, map_scan)
+
+    *odom_pose*    – Pose dataclass (x, y, theta) from wheel odometry.
+    *current_scan* – list[(angle_rad, dist_m)] fresh from LidarManager.
+    *map_scan*     – list[(angle_rad, dist_m)] reference cloud (previous scan or
+                     map-derived points).  If None/empty the odom pose is returned
+                     unchanged (first frame bootstrap).
+
+    The corrected pose is blended with the odometry pose using
+    ``config.LIDAR_ICP_WEIGHT`` so a single bad scan doesn't teleport the rover.
+    """
+
+    def __init__(self) -> None:
+        self._ref_cloud: np.ndarray | None = None   # (N,2) xy in world frame
+        self._last_run: float = 0.0
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    def correct(self, pose, current_scan: list) -> "Pose":  # type: ignore[name-defined]
+        """Return pose corrected by ICP (or original pose if ICP not ready)."""
+        from app import config
+        from app.robot.state import Pose, wrap_angle
+
+        now = time.time()
+        if (now - self._last_run) < config.LIDAR_ICP_INTERVAL_S:
+            return pose  # rate-limit ICP
+
+        pts = self._scan_to_world(current_scan, pose)
+        if pts is None or len(pts) < config.LIDAR_ICP_MIN_POINTS:
+            self._ref_cloud = pts
+            self._last_run = now
+            return pose
+
+        if self._ref_cloud is None or len(self._ref_cloud) < config.LIDAR_ICP_MIN_POINTS:
+            self._ref_cloud = pts
+            self._last_run = now
+            return pose
+
+        dx, dy, dtheta = self._icp(pts, self._ref_cloud)
+        self._ref_cloud = pts   # update reference to current scan
+        self._last_run = now
+
+        w = config.LIDAR_ICP_WEIGHT
+        corrected = Pose(
+            x     = pose.x     + w * dx,
+            y     = pose.y     + w * dy,
+            theta = wrap_angle(pose.theta + w * dtheta),
+        )
+        return corrected
+
+    def reset(self) -> None:
+        """Call when map is cleared or robot is manually relocated."""
+        self._ref_cloud = None
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _scan_to_world(scan: list, pose) -> "np.ndarray | None":
+        """Convert polar scan to world-frame (N,2) xy array."""
+        if not scan:
+            return None
+        pts = []
+        cos_t = math.cos(pose.theta)
+        sin_t = math.sin(pose.theta)
+        for angle, dist in scan:
+            # robot frame
+            rx = dist * math.cos(angle)
+            ry = dist * math.sin(angle)
+            # world frame
+            wx = pose.x + cos_t * rx - sin_t * ry
+            wy = pose.y + sin_t * rx + cos_t * ry
+            pts.append((wx, wy))
+        return np.array(pts, dtype=np.float32)
+
+    @staticmethod
+    def _icp(src: np.ndarray, ref: np.ndarray) -> tuple:
+        """Simplified point-to-point ICP returning (dx, dy, dtheta)."""
+        from app import config
+
+        s = src.copy()
+        total_dx = 0.0
+        total_dy = 0.0
+        total_dtheta = 0.0
+
+        for _ in range(config.LIDAR_ICP_MAX_ITERATIONS):
+            # Find nearest neighbours (brute force — small scans are fast)
+            diffs   = ref[np.newaxis, :, :] - s[:, np.newaxis, :]  # (Ns, Nr, 2)
+            dists2  = (diffs ** 2).sum(axis=2)                       # (Ns, Nr)
+            nn_idx  = dists2.argmin(axis=1)                          # (Ns,)
+            nn_dist = dists2[np.arange(len(s)), nn_idx] ** 0.5
+
+            # Reject far correspondences
+            mask = nn_dist < config.LIDAR_ICP_MAX_CORRESP_M
+            if mask.sum() < 5:
+                break
+            matched_src = s[mask]
+            matched_ref = ref[nn_idx[mask]]
+
+            # Compute centroids
+            cs = matched_src.mean(axis=0)
+            cr = matched_ref.mean(axis=0)
+
+            # SVD-based rotation
+            H   = (matched_src - cs).T @ (matched_ref - cr)
+            try:
+                U, _, Vt = np.linalg.svd(H)
+            except np.linalg.LinAlgError:
+                break
+            R   = Vt.T @ U.T
+            # Ensure proper rotation (det = +1)
+            if np.linalg.det(R) < 0:
+                Vt[-1, :] *= -1
+                R = Vt.T @ U.T
+
+            t   = cr - R @ cs
+            dtheta_step = math.atan2(float(R[1, 0]), float(R[0, 0]))
+
+            # Apply transform to src cloud
+            s = (R @ s.T).T + t
+
+            total_dx     += float(t[0])
+            total_dy     += float(t[1])
+            total_dtheta += dtheta_step
+
+            if abs(t[0]) < config.LIDAR_ICP_TOLERANCE_M and \
+               abs(t[1]) < config.LIDAR_ICP_TOLERANCE_M:
+                break
+
+        return total_dx, total_dy, total_dtheta

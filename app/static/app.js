@@ -1,14 +1,16 @@
 /**
- * Arespath Rover — Dashboard app.js  v3
+ * Arespath Rover — Dashboard app.js  v4
  *
- * Features
- * ────────
- * • D-pad + keyboard hold-to-drive with 100 ms repeat; release → STOP
- * • Lidar radar draws obstacle-free detour route when blocked
- * • Ring-buffer snapshot toggle (auto, 10 s interval, max 10/cam)
- * • Permanent photo capture (both cameras, stored forever)
- * • Gallery modals for snapshots (tabbed by camera) and photos (all)
- * • Lightbox on image click
+ * New in v4
+ * ─────────
+ * • 10 000 sq.ft map (48 m × 48 m grid, 960 × 960 cells)
+ * • POI / Gazebo waypoints — add, move, label, navigate-to, delete
+ * • Map pan & zoom — scroll wheel + drag-to-pan (Pan tool) + zoom buttons
+ * • LiDAR ICP localisation status pill
+ * • Mapping + pilot control glitch fix — map worker thread decoupled in backend;
+ *   frontend uses independent debounced loops that never block each other
+ * • All poll loops use a sequential debounce pattern (next tick starts only
+ *   after previous await resolves) → no overlapping fetches
  */
 
 'use strict';
@@ -18,12 +20,20 @@ const STATE = {
   armed:       false,
   mode:        'pilot',
   wsAlive:     false,
-  mapTool:     'goal',
+  mapTool:     'goal',   // 'goal' | 'start' | 'poi' | 'pan'
   mapMeta:     null,
   dragStart:   null,
   headingPrev: 0,
   activeCmd:   null,
   snapping:    false,
+  // Map viewport (pan + zoom)
+  mapZoom:     1.0,
+  mapPanX:     0,      // canvas-pixel offset
+  mapPanY:     0,
+  mapDragging: false,
+  mapDragLast: null,
+  // POI pending placement
+  pendingPoi:  null,   // {x, y} world coords awaiting form submit
 };
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
@@ -37,18 +47,26 @@ const EL = {
   speedValue:      el('speedValue'),
   toolGoalBtn:     el('toolGoalBtn'),
   toolStartBtn:    el('toolStartBtn'),
+  toolPoiBtn:      el('toolPoiBtn'),
+  toolPanBtn:      el('toolPanBtn'),
   mapStartBtn:     el('mapStartBtn'),
   mapStopBtn:      el('mapStopBtn'),
   mapResetBtn:     el('mapResetBtn'),
   saveMapBtn:      el('saveMapBtn'),
   loadMapBtn:      el('loadMapBtn'),
   cancelNavBtn:    el('cancelNavBtn'),
+  mapZoomInBtn:    el('mapZoomInBtn'),
+  mapZoomOutBtn:   el('mapZoomOutBtn'),
+  mapZoomResetBtn: el('mapZoomResetBtn'),
+  zoomLevel:       el('zoomLevel'),
   mapName:         el('mapName'),
   mapSelect:       el('mapSelect'),
   mapCanvas:       el('mapCanvas'),
+  mapOuter:        el('mapOuter'),
   radarCanvas:     el('radarCanvas'),
   sceneCanvas:     el('sceneCanvas'),
   wsPill:          el('ws-pill'),
+  icpPill:         el('icp-pill'),
   avoidBadge:      el('avoidBadge'),
   snapToggleBtn:   el('snapToggleBtn'),
   snapCountFront:  el('snapCountFront'),
@@ -63,6 +81,25 @@ const EL = {
   modalSub:        el('modalSub'),
   modalTabs:       el('modalTabs'),
   modalGallery:    el('modalGallery'),
+  // POI
+  poiModal:        el('poiModal'),
+  poiModalClose:   el('poiModalClose'),
+  poiLabel:        el('poiLabel'),
+  poiKind:         el('poiKind'),
+  poiNote:         el('poiNote'),
+  poiCoordPreview: el('poiCoordPreview'),
+  poiSaveBtn:      el('poiSaveBtn'),
+  poiEditModal:    el('poiEditModal'),
+  poiEditClose:    el('poiEditClose'),
+  poiEditId:       el('poiEditId'),
+  poiEditLabel:    el('poiEditLabel'),
+  poiEditKind:     el('poiEditKind'),
+  poiEditNote:     el('poiEditNote'),
+  poiEditNavBtn:   el('poiEditNavBtn'),
+  poiEditSaveBtn:  el('poiEditSaveBtn'),
+  poiEditDelBtn:   el('poiEditDelBtn'),
+  poiSidebarList:  el('poi-sidebar-list'),
+  toolHintInline:  el('tool-hint-inline'),
 };
 
 const mapCtx   = EL.mapCanvas.getContext('2d');
@@ -101,7 +138,7 @@ socket.on('status', applyStatus);
 
 setInterval(() => { if (STATE.wsAlive) socket.emit('heartbeat', {}); }, 1000);
 
-// ── Speed helper ──────────────────────────────────────────────────────────────
+// ── Speed ─────────────────────────────────────────────────────────────────────
 function speed() { return Number(EL.speedSlider.value); }
 EL.speedSlider.addEventListener('input', () => {
   EL.speedValue.textContent = `${EL.speedSlider.value}%`;
@@ -142,14 +179,14 @@ function _cmdToVector(cmd, sp) {
   const map = {
     forward: { linear:  sp, angular:  0 },
     back:    { linear: -sp, angular:  0 },
-    left:    { linear:  0,  angular: -sp },
-    right:   { linear:  0,  angular:  sp },
+    left:    { linear:  0,  angular:  sp },
+    right:   { linear:  0,  angular: -sp },
     stop:    { linear:  0,  angular:  0 },
   };
   return map[cmd] || { linear: 0, angular: 0 };
 }
 
-// ── D-pad hold-to-drive with 100 ms repeat ────────────────────────────────────
+// ── D-pad hold-to-drive ───────────────────────────────────────────────────────
 const REPEAT_MS = 100;
 let _repeatTimer = null;
 
@@ -210,10 +247,8 @@ window.addEventListener('keyup', e => {
   if (cmd && (STATE.activeCmd === cmd || cmd === 'stop')) sendStop();
 });
 
-window.addEventListener('blur', () => { _stopRepeat(); sendStop(); });
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { _stopRepeat(); sendStop(); }
-});
+window.addEventListener('blur',             () => { _stopRepeat(); sendStop(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) { _stopRepeat(); sendStop(); } });
 
 // ── Arm / Stop ────────────────────────────────────────────────────────────────
 EL.armBtn.addEventListener('click', async () => {
@@ -225,38 +260,242 @@ EL.armBtn.addEventListener('click', async () => {
 EL.stopBtn.addEventListener('click', () => sendStop());
 
 // ── Mode buttons ──────────────────────────────────────────────────────────────
-EL.pilotBtn.addEventListener('click', () =>
-  api('/api/mode', 'POST', { mode: 'pilot' }).then(refreshStatus).catch(() => {}));
-EL.missionBtn.addEventListener('click', () =>
-  api('/api/mode', 'POST', { mode: 'mission' }).then(refreshStatus).catch(() => {}));
+EL.pilotBtn.addEventListener('click',   () => api('/api/mode', 'POST', { mode: 'pilot'   }).then(refreshStatus).catch(() => {}));
+EL.missionBtn.addEventListener('click', () => api('/api/mode', 'POST', { mode: 'mission' }).then(refreshStatus).catch(() => {}));
 
 // ── Map tool buttons ──────────────────────────────────────────────────────────
-EL.toolGoalBtn.addEventListener('click', () => setTool('goal'));
+EL.toolGoalBtn .addEventListener('click', () => setTool('goal'));
 EL.toolStartBtn.addEventListener('click', () => setTool('start'));
+EL.toolPoiBtn  .addEventListener('click', () => setTool('poi'));
+EL.toolPanBtn  .addEventListener('click', () => setTool('pan'));
 
 function setTool(tool) {
   STATE.mapTool = tool;
-  setText('tool-label', tool.toUpperCase());
-  EL.toolGoalBtn.classList.toggle('active', tool === 'goal');
+  const labels = { goal: 'GOAL', start: 'START POSE', poi: '+POI', pan: 'PAN' };
+  setText('tool-label', labels[tool] || tool.toUpperCase());
+  if (EL.toolHintInline) EL.toolHintInline.textContent = labels[tool] || tool.toUpperCase();
+  EL.toolGoalBtn .classList.toggle('active', tool === 'goal');
   EL.toolStartBtn.classList.toggle('active', tool === 'start');
+  EL.toolPoiBtn  .classList.toggle('active', tool === 'poi');
+  EL.toolPanBtn  .classList.toggle('active', tool === 'pan');
+  EL.mapCanvas.style.cursor = tool === 'pan' ? 'grab' : 'crosshair';
 }
 
 // ── Map controls ──────────────────────────────────────────────────────────────
-EL.mapStartBtn.addEventListener('click', () =>
-  api('/api/map/start', 'POST', { clear: false }).catch(() => {}));
-EL.mapStopBtn.addEventListener('click', () =>
-  api('/api/map/stop', 'POST', {}).catch(() => {}));
-EL.mapResetBtn.addEventListener('click', () =>
-  api('/api/map/reset', 'POST', {}).catch(() => {}));
-EL.saveMapBtn.addEventListener('click', () =>
-  api('/api/map/save', 'POST', { name: EL.mapName.value || 'map' })
-    .then(refreshMapList).catch(() => {}));
-EL.loadMapBtn.addEventListener('click', () => {
+EL.mapStartBtn .addEventListener('click', () => api('/api/map/start', 'POST', { clear: false }).catch(() => {}));
+EL.mapStopBtn  .addEventListener('click', () => api('/api/map/stop',  'POST', {}).catch(() => {}));
+EL.mapResetBtn .addEventListener('click', () => api('/api/map/reset', 'POST', {}).catch(() => {}));
+EL.saveMapBtn  .addEventListener('click', () =>
+  api('/api/map/save', 'POST', { name: EL.mapName.value || 'map' }).then(refreshMapList).catch(() => {}));
+EL.loadMapBtn  .addEventListener('click', () => {
   const name = EL.mapSelect.value;
   if (name) api('/api/map/load', 'POST', { name }).catch(() => {});
 });
-EL.cancelNavBtn.addEventListener('click', () =>
-  api('/api/navigate/cancel', 'POST', {}).catch(() => {}));
+EL.cancelNavBtn.addEventListener('click', () => api('/api/navigate/cancel', 'POST', {}).catch(() => {}));
+
+// ── Map zoom / pan buttons ────────────────────────────────────────────────────
+EL.mapZoomInBtn   .addEventListener('click', () => applyZoom(1.25));
+EL.mapZoomOutBtn  .addEventListener('click', () => applyZoom(0.80));
+EL.mapZoomResetBtn.addEventListener('click', () => { STATE.mapZoom = 1; STATE.mapPanX = 0; STATE.mapPanY = 0; _updateMapTransform(); });
+
+function applyZoom(factor) {
+  const cw = EL.mapCanvas.width, ch = EL.mapCanvas.height;
+  STATE.mapZoom = Math.max(0.25, Math.min(8, STATE.mapZoom * factor));
+  _updateMapTransform();
+}
+
+function _updateMapTransform() {
+  const z = STATE.mapZoom;
+  const cw = EL.mapCanvas.width, ch = EL.mapCanvas.height;
+  const ox = (cw * (1 - z)) / 2 + STATE.mapPanX;
+  const oy = (ch * (1 - z)) / 2 + STATE.mapPanY;
+  EL.mapCanvas.style.transform       = `translate(${ox}px, ${oy}px) scale(${z})`;
+  EL.mapCanvas.style.transformOrigin = '50% 50%';
+  if (EL.zoomLevel) EL.zoomLevel.textContent = `${z.toFixed(1)}×`;
+}
+
+// ── Scroll-wheel zoom ─────────────────────────────────────────────────────────
+EL.mapOuter && EL.mapOuter.addEventListener('wheel', e => {
+  e.preventDefault();
+  applyZoom(e.deltaY < 0 ? 1.12 : 0.89);
+}, { passive: false });
+
+// ── Pan gestures on map canvas ────────────────────────────────────────────────
+EL.mapCanvas.addEventListener('pointerdown', e => {
+  if (STATE.mapTool === 'pan') {
+    STATE.mapDragging = true;
+    STATE.mapDragLast = { x: e.clientX, y: e.clientY };
+    EL.mapCanvas.style.cursor = 'grabbing';
+    EL.mapCanvas.setPointerCapture(e.pointerId);
+    return;
+  }
+  if (!STATE.mapMeta) return;
+  STATE.dragStart = canvasToWorld(e, STATE.mapMeta);
+});
+
+EL.mapCanvas.addEventListener('pointermove', e => {
+  if (STATE.mapTool === 'pan' && STATE.mapDragging && STATE.mapDragLast) {
+    const dx = e.clientX - STATE.mapDragLast.x;
+    const dy = e.clientY - STATE.mapDragLast.y;
+    STATE.mapPanX += dx;
+    STATE.mapPanY += dy;
+    STATE.mapDragLast = { x: e.clientX, y: e.clientY };
+    _updateMapTransform();
+    return;
+  }
+  if (!STATE.dragStart || !STATE.mapMeta || STATE.mapTool !== 'start') return;
+  const cur = canvasToWorld(e, STATE.mapMeta);
+  STATE.headingPrev = Math.atan2(cur.y - STATE.dragStart.y, cur.x - STATE.dragStart.x);
+});
+
+EL.mapCanvas.addEventListener('pointerup', e => {
+  if (STATE.mapTool === 'pan') {
+    STATE.mapDragging = false;
+    STATE.mapDragLast = null;
+    EL.mapCanvas.style.cursor = 'grab';
+    return;
+  }
+  if (!STATE.mapMeta) return;
+  const pt = canvasToWorld(e, STATE.mapMeta);
+  if (STATE.mapTool === 'goal') {
+    api('/api/navigate/goal', 'POST', { x: pt.x, y: pt.y }).catch(() => {});
+  } else if (STATE.mapTool === 'start') {
+    const start = STATE.dragStart || pt;
+    api('/api/pose', 'POST', { x: start.x, y: start.y, theta: STATE.headingPrev }).catch(() => {});
+  } else if (STATE.mapTool === 'poi') {
+    _openPoiAdd(pt.x, pt.y);
+  }
+  STATE.dragStart = null;
+});
+
+EL.mapCanvas.addEventListener('pointercancel', () => {
+  STATE.mapDragging = false; STATE.mapDragLast = null;
+});
+
+function canvasToWorld(e, meta) {
+  const rect = EL.mapCanvas.getBoundingClientRect();
+  // Account for zoom/pan — getBoundingClientRect gives display coords
+  const scaleX = EL.mapCanvas.width  / rect.width;
+  const scaleY = EL.mapCanvas.height / rect.height;
+  const cx = Math.round((e.clientX - rect.left) * scaleX);
+  const cy = Math.round((e.clientY - rect.top)  * scaleY);
+  return {
+    x: cx * meta.resolution + meta.origin[0],
+    y: cy * meta.resolution + meta.origin[1],
+  };
+}
+
+// ── POI — add flow ────────────────────────────────────────────────────────────
+function _openPoiAdd(wx, wy) {
+  STATE.pendingPoi = { x: wx, y: wy };
+  EL.poiLabel.value = '';
+  EL.poiKind.value  = 'waypoint';
+  EL.poiNote.value  = '';
+  EL.poiCoordPreview.textContent = `(${wx.toFixed(2)} m, ${wy.toFixed(2)} m)`;
+  EL.poiModal.style.display = 'flex';
+  EL.poiLabel.focus();
+}
+
+EL.poiModalClose.addEventListener('click', () => { EL.poiModal.style.display = 'none'; });
+
+EL.poiSaveBtn.addEventListener('click', async () => {
+  if (!STATE.pendingPoi) return;
+  const label = EL.poiLabel.value.trim() || 'Waypoint';
+  const kind  = EL.poiKind.value;
+  const note  = EL.poiNote.value.trim();
+  try {
+    await api('/api/poi', 'POST', { label, kind, note, ...STATE.pendingPoi });
+    EL.poiModal.style.display = 'none';
+    STATE.pendingPoi = null;
+    await refreshPois();
+  } catch (err) {
+    alert('POI save failed: ' + err.message);
+  }
+});
+
+// ── POI — edit flow ───────────────────────────────────────────────────────────
+function _openPoiEdit(poi) {
+  EL.poiEditId.value    = poi.id;
+  EL.poiEditLabel.value = poi.label;
+  EL.poiEditKind.value  = poi.kind;
+  EL.poiEditNote.value  = poi.note || '';
+  EL.poiEditModal.style.display = 'flex';
+}
+
+EL.poiEditClose.addEventListener('click', () => { EL.poiEditModal.style.display = 'none'; });
+
+EL.poiEditSaveBtn.addEventListener('click', async () => {
+  const id = EL.poiEditId.value;
+  try {
+    await api(`/api/poi/${id}`, 'PATCH', {
+      label: EL.poiEditLabel.value.trim(),
+      kind:  EL.poiEditKind.value,
+      note:  EL.poiEditNote.value.trim(),
+    });
+    EL.poiEditModal.style.display = 'none';
+    await refreshPois();
+  } catch (err) { alert('Update failed: ' + err.message); }
+});
+
+EL.poiEditNavBtn.addEventListener('click', async () => {
+  const id = EL.poiEditId.value;
+  try {
+    await api(`/api/poi/${id}/navigate`, 'POST', {});
+    EL.poiEditModal.style.display = 'none';
+  } catch (err) { alert('Navigate failed: ' + err.message); }
+});
+
+EL.poiEditDelBtn.addEventListener('click', async () => {
+  if (!confirm('Delete this POI?')) return;
+  const id = EL.poiEditId.value;
+  try {
+    await api(`/api/poi/${id}`, 'DELETE');
+    EL.poiEditModal.style.display = 'none';
+    await refreshPois();
+  } catch (err) { alert('Delete failed: ' + err.message); }
+});
+
+// ── POI sidebar refresh ───────────────────────────────────────────────────────
+const KIND_ICON = { gazebo: '⛺', waypoint: '📍', dock: '🔌', custom: '⭐' };
+
+async function refreshPois() {
+  try {
+    const data = await api('/api/poi');
+    const pois = data.pois || [];
+    if (!pois.length) {
+      EL.poiSidebarList.innerHTML = '<p class="hint">No POIs yet. Select "+POI" tool and click the map.</p>';
+      return;
+    }
+    EL.poiSidebarList.innerHTML = '';
+    pois.forEach(poi => {
+      const row = document.createElement('div');
+      row.className = 'poi-row';
+      row.innerHTML = `
+        <span class="poi-icon">${KIND_ICON[poi.kind] || '⭐'}</span>
+        <span class="poi-name">${_esc(poi.label)}</span>
+        <button class="poi-nav-btn secondary" data-id="${poi.id}" title="Navigate here">▶</button>
+        <button class="poi-edit-btn secondary" data-id="${poi.id}" title="Edit">✎</button>
+      `;
+      EL.poiSidebarList.appendChild(row);
+    });
+    // Bind buttons
+    EL.poiSidebarList.querySelectorAll('.poi-nav-btn').forEach(btn => {
+      btn.addEventListener('click', () => api(`/api/poi/${btn.dataset.id}/navigate`, 'POST', {}).catch(err => alert(err.message)));
+    });
+    EL.poiSidebarList.querySelectorAll('.poi-edit-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const poi = pois.find(p => p.id === btn.dataset.id);
+        if (poi) _openPoiEdit(poi);
+      });
+    });
+    // Store pois for map canvas
+    STATE._pois = pois;
+  } catch (_) {}
+}
+
+function _esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
 
 // ── Snapshot ring-buffer toggle ───────────────────────────────────────────────
 EL.snapToggleBtn.addEventListener('click', async () => {
@@ -313,220 +552,128 @@ EL.takePhotoBtn.addEventListener('click', async () => {
 });
 
 // ── Gallery modal ─────────────────────────────────────────────────────────────
-let _galleryMode   = 'snapshots'; // 'snapshots' | 'photos'
-let _galleryData   = {};          // raw API response
-let _galleryTab    = 'front';     // active tab for snapshots
+let _galleryMode = 'snapshots';
+let _galleryData = {};
+let _galleryTab  = 'front';
 
 function _fmtTime(ts) {
   const d = new Date(ts * 1000);
-  return d.toLocaleString('en-GB', {
-    day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit'
-  });
+  return d.toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
-
 function _fmtSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024)        return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 }
 
-// Open snapshot gallery
 EL.viewSnapshotsBtn.addEventListener('click', async () => {
-  _galleryMode = 'snapshots';
-  _galleryTab  = 'front';
-  EL.modalTitle.textContent = '📷 Auto Snapshots';
-  EL.modalSub.textContent   = 'Ring-buffer — newest first — max 10 per camera';
-  EL.modalTabs.style.display = '';
-  EL.modalGallery.innerHTML  = '<div class="modal-empty">Loading…</div>';
+  _galleryMode = 'snapshots'; _galleryTab = 'front';
+  EL.modalTitle.textContent    = '📷 Auto Snapshots';
+  EL.modalSub.textContent      = 'Ring-buffer — newest first — max 10 per camera';
+  EL.modalTabs.style.display   = '';
+  EL.modalGallery.innerHTML    = '<div class="modal-empty">Loading…</div>';
   EL.modalOverlay.style.display = 'flex';
   try {
     const data = await api('/api/snapshot/files');
     _galleryData = data.files || {};
     _setActiveTab(_galleryTab);
     _renderSnapshots();
-  } catch (e) {
-    EL.modalGallery.innerHTML = `<div class="modal-empty">Error: ${e.message}</div>`;
-  }
+  } catch (e) { EL.modalGallery.innerHTML = `<div class="modal-empty">Error: ${e.message}</div>`; }
 });
 
-// Open photo gallery
 EL.viewPhotosBtn.addEventListener('click', async () => {
   _galleryMode = 'photos';
-  EL.modalTitle.textContent  = '🗂 Permanent Photos';
-  EL.modalSub.textContent    = 'All captured photos — stored permanently';
-  EL.modalTabs.style.display = 'none';
-  EL.modalGallery.innerHTML  = '<div class="modal-empty">Loading…</div>';
+  EL.modalTitle.textContent    = '🗂 Permanent Photos';
+  EL.modalSub.textContent      = 'All captured photos — stored permanently';
+  EL.modalTabs.style.display   = 'none';
+  EL.modalGallery.innerHTML    = '<div class="modal-empty">Loading…</div>';
   EL.modalOverlay.style.display = 'flex';
   try {
     const data = await api('/api/photo/files');
     _renderPhotos(data.files || []);
-  } catch (e) {
-    EL.modalGallery.innerHTML = `<div class="modal-empty">Error: ${e.message}</div>`;
-  }
+  } catch (e) { EL.modalGallery.innerHTML = `<div class="modal-empty">Error: ${e.message}</div>`; }
 });
 
-// Tab switching
 EL.modalTabs.querySelectorAll('.modal-tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    _setActiveTab(tab.dataset.tab);
-    _renderSnapshots();
-  });
+  tab.addEventListener('click', () => { _setActiveTab(tab.dataset.tab); _renderSnapshots(); });
 });
 
 function _setActiveTab(tab) {
   _galleryTab = tab;
-  EL.modalTabs.querySelectorAll('.modal-tab').forEach(t => {
-    t.classList.toggle('active', t.dataset.tab === tab);
-  });
+  EL.modalTabs.querySelectorAll('.modal-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
 }
 
 function _renderSnapshots() {
   const files = _galleryData;
   let items = [];
   if (_galleryTab === 'all') {
-    // Merge all cameras, sort by filename (timestamp embedded)
     const all = [];
-    Object.entries(files).forEach(([cam, fnames]) => {
-      fnames.forEach(f => all.push({ cam, f }));
-    });
+    Object.entries(files).forEach(([cam, fnames]) => fnames.forEach(f => all.push({ cam, f })));
     all.sort((a, b) => b.f.localeCompare(a.f));
     items = all;
   } else {
     items = (files[_galleryTab] || []).map(f => ({ cam: _galleryTab, f }));
   }
-
-  if (!items.length) {
-    EL.modalGallery.innerHTML = '<div class="modal-empty">No snapshots yet. Start snapshot capture to begin.</div>';
-    return;
-  }
+  if (!items.length) { EL.modalGallery.innerHTML = '<div class="modal-empty">No snapshots yet.</div>'; return; }
   EL.modalGallery.innerHTML = '';
-  const grid = document.createElement('div');
-  grid.className = 'gallery-grid';
+  const grid = document.createElement('div'); grid.className = 'gallery-grid';
   items.forEach(({ cam, f }) => {
     const ts = _parseTs(f);
-    grid.appendChild(_makeCard({
-      src:      `/snapshots/${f}`,
-      dlHref:   `/snapshots/${f}?dl=1`,
-      dlName:   f,
-      metaTop:  `<strong>${cam}</strong>`,
-      metaBot:  ts ? _fmtTime(ts) : f,
-    }));
+    grid.appendChild(_makeCard({ src: `/snapshots/${f}`, dlHref: `/snapshots/${f}?dl=1`, dlName: f,
+      metaTop: `<strong>${cam}</strong>`, metaBot: ts ? _fmtTime(ts) : f }));
   });
   EL.modalGallery.appendChild(grid);
 }
 
 function _renderPhotos(photos) {
-  if (!photos.length) {
-    EL.modalGallery.innerHTML = '<div class="modal-empty">No photos taken yet. Use "Take Photo" to capture.</div>';
-    return;
-  }
+  if (!photos.length) { EL.modalGallery.innerHTML = '<div class="modal-empty">No photos taken yet.</div>'; return; }
   EL.modalGallery.innerHTML = '';
-  const grid = document.createElement('div');
-  grid.className = 'gallery-grid';
+  const grid = document.createElement('div'); grid.className = 'gallery-grid';
   photos.forEach(p => {
-    grid.appendChild(_makeCard({
-      src:      `/photos/${p.filename}`,
-      dlHref:   `/photos/${p.filename}?dl=1`,
-      dlName:   p.filename,
-      metaTop:  `<strong>${p.cam}</strong> · ${_fmtSize(p.size)}`,
-      metaBot:  _fmtTime(p.ts),
-    }));
+    grid.appendChild(_makeCard({ src: `/photos/${p.filename}`, dlHref: `/photos/${p.filename}?dl=1`, dlName: p.filename,
+      metaTop: `<strong>${p.cam}</strong> · ${_fmtSize(p.size)}`, metaBot: _fmtTime(p.ts) }));
   });
   EL.modalGallery.appendChild(grid);
 }
 
 function _makeCard({ src, dlHref, dlName, metaTop, metaBot }) {
-  const card = document.createElement('div');
-  card.className = 'gallery-card';
-
+  const card = document.createElement('div'); card.className = 'gallery-card';
   const img = document.createElement('img');
-  img.className = 'gallery-img';
-  img.src = src;
-  img.alt = dlName;
-  img.loading = 'lazy';
+  img.className = 'gallery-img'; img.src = src; img.alt = dlName; img.loading = 'lazy';
   img.addEventListener('click', () => _openLightbox(src));
-
-  const foot = document.createElement('div');
-  foot.className = 'gallery-card-foot';
-
-  const meta = document.createElement('div');
-  meta.className = 'gallery-meta';
-  meta.innerHTML = `${metaTop}<br>${metaBot}`;
-
-  const dlLink = document.createElement('a');
-  dlLink.className = 'gallery-dl';
-  dlLink.href = dlHref;
-  dlLink.download = dlName;
-  dlLink.textContent = '⬇ Download';
-
-  foot.appendChild(meta);
-  foot.appendChild(dlLink);
-  card.appendChild(img);
-  card.appendChild(foot);
+  const foot = document.createElement('div'); foot.className = 'gallery-card-foot';
+  const meta = document.createElement('div'); meta.className = 'gallery-meta'; meta.innerHTML = `${metaTop}<br>${metaBot}`;
+  const dlLink = document.createElement('a'); dlLink.className = 'gallery-dl';
+  dlLink.href = dlHref; dlLink.download = dlName; dlLink.textContent = '⬇ Download';
+  foot.appendChild(meta); foot.appendChild(dlLink); card.appendChild(img); card.appendChild(foot);
   return card;
 }
 
 function _parseTs(filename) {
-  // filename pattern: <cam>_<ts>.jpg or photo_<cam>_<ts>.jpg
   const m = filename.match(/_(\d{9,13})\.jpg$/);
   return m ? parseInt(m[1], 10) : null;
 }
 
-// Close modal
 EL.modalClose.addEventListener('click', () => { EL.modalOverlay.style.display = 'none'; });
-EL.modalOverlay.addEventListener('click', e => {
-  if (e.target === EL.modalOverlay) EL.modalOverlay.style.display = 'none';
-});
+EL.modalOverlay.addEventListener('click', e => { if (e.target === EL.modalOverlay) EL.modalOverlay.style.display = 'none'; });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') EL.modalOverlay.style.display = 'none';
+  if (e.key === 'Escape') {
+    EL.modalOverlay.style.display = 'none';
+    EL.poiModal.style.display = 'none';
+    EL.poiEditModal.style.display = 'none';
+  }
 });
 
 // ── Lightbox ──────────────────────────────────────────────────────────────────
 function _openLightbox(src) {
-  const lb = document.createElement('div');
-  lb.className = 'lightbox';
-  const img = document.createElement('img');
-  img.src = src;
+  const lb = document.createElement('div'); lb.className = 'lightbox';
+  const img = document.createElement('img'); img.src = src;
   lb.appendChild(img);
   lb.addEventListener('click', () => lb.remove());
   document.addEventListener('keydown', function esc(e) {
     if (e.key === 'Escape') { lb.remove(); document.removeEventListener('keydown', esc); }
   });
   document.body.appendChild(lb);
-}
-
-// ── Map canvas interactions ────────────────────────────────────────────────────
-EL.mapCanvas.addEventListener('pointerdown', e => {
-  if (!STATE.mapMeta) return;
-  STATE.dragStart = canvasToWorld(e, STATE.mapMeta);
-});
-EL.mapCanvas.addEventListener('pointermove', e => {
-  if (!STATE.dragStart || !STATE.mapMeta || STATE.mapTool !== 'start') return;
-  const cur = canvasToWorld(e, STATE.mapMeta);
-  STATE.headingPrev = Math.atan2(cur.y - STATE.dragStart.y, cur.x - STATE.dragStart.x);
-});
-EL.mapCanvas.addEventListener('pointerup', e => {
-  if (!STATE.mapMeta) return;
-  const pt = canvasToWorld(e, STATE.mapMeta);
-  if (STATE.mapTool === 'goal') {
-    api('/api/navigate/goal', 'POST', { x: pt.x, y: pt.y }).catch(() => {});
-  } else {
-    const start = STATE.dragStart || pt;
-    api('/api/pose', 'POST', { x: start.x, y: start.y, theta: STATE.headingPrev }).catch(() => {});
-  }
-  STATE.dragStart = null;
-});
-
-function canvasToWorld(e, meta) {
-  const rect = EL.mapCanvas.getBoundingClientRect();
-  const cx = (e.clientX - rect.left) / rect.width;
-  const cy = (e.clientY - rect.top)  / rect.height;
-  const gx = Math.round(cx * meta.width);
-  const gy = Math.round(cy * meta.height);
-  return {
-    x: gx * meta.resolution + meta.origin[0],
-    y: gy * meta.resolution + meta.origin[1],
-  };
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
@@ -544,9 +691,7 @@ function applyStatus(s) {
   setText('st-connected', s.connected ? 'ONLINE' : 'OFFLINE');
   setText('st-lidar',     s.lidar_connected ? 'READY' : 'OFF');
   setText('st-mode',      s.mode.toUpperCase());
-  setText('st-safety',    s.obstacle_stop ? 'BLOCKED' : 'CLEAR');
   setText('st-battery',   s.battery_v != null ? `${s.battery_v.toFixed(2)} V` : '--');
-  setText('st-nav',       s.nav?.status || '--');
   setText('st-age',       `${(s.telemetry_age_s ?? 0).toFixed(1)} s`);
   setText('st-error',     s.last_error || '--');
   setText('pose-x',       (s.pose?.x ?? 0).toFixed(2));
@@ -558,6 +703,64 @@ function applyStatus(s) {
   setText('right-pwm',    String(s.right_pwm ?? 0));
   setText('scan-pts',     String(s.latest_scan_points ?? 0));
   setText('path-pts',     String(s.nav?.path?.length ?? 0));
+
+  // Safety + obstacle countdown
+  const rem = s.obstacle_wait_remaining_s;
+  if (s.obstacle_stop && rem !== null && rem !== undefined && rem > 0) {
+    setText('st-safety', `⏳ ${rem.toFixed(0)} s`);
+    _setObstacleCountdown(rem, 5.0);
+  } else if (s.obstacle_stop) {
+    setText('st-safety', 'BLOCKED');
+    _clearObstacleCountdown();
+  } else {
+    setText('st-safety', 'CLEAR');
+    _clearObstacleCountdown();
+  }
+
+  // Mission status — highlight countdown state
+  const navSt = s.nav?.status || '--';
+  setText('st-nav', navSt);
+  const navEl = document.getElementById('st-nav');
+  if (navEl) {
+    navEl.style.color = navSt.includes('waiting') ? '#fbbf24'
+                      : navSt.includes('replan')  ? '#f87171'
+                      : navSt.includes('reached') ? '#34d399'
+                      : '';
+  }
+
+  // ICP pill
+  EL.icpPill.className = s.lidar_connected ? 'pill good' : 'pill dim';
+}
+
+// ── Obstacle countdown ring ───────────────────────────────────────────────────
+let _cdTimer = null;
+function _setObstacleCountdown(remaining, total) {
+  let ring = document.getElementById('obs-countdown-ring');
+  if (!ring) {
+    // Inject SVG ring into conn-bar
+    const wrap = document.createElement('span');
+    wrap.id = 'obs-countdown-wrap';
+    wrap.title = 'Obstacle patience timer';
+    wrap.innerHTML = `<svg id="obs-countdown-ring" width="22" height="22" viewBox="0 0 22 22">
+      <circle cx="11" cy="11" r="9" fill="none" stroke="rgba(251,191,36,0.2)" stroke-width="2.5"/>
+      <circle id="obs-cd-arc" cx="11" cy="11" r="9" fill="none" stroke="#fbbf24" stroke-width="2.5"
+        stroke-dasharray="56.55" stroke-dashoffset="0" stroke-linecap="round"
+        transform="rotate(-90 11 11)"/>
+      <text id="obs-cd-txt" x="11" y="14.5" text-anchor="middle" font-size="7" fill="#fbbf24" font-family="monospace"></text>
+    </svg>`;
+    document.getElementById('conn-bar').appendChild(wrap);
+    ring = document.getElementById('obs-countdown-ring');
+  }
+  const arc = document.getElementById('obs-cd-arc');
+  const txt = document.getElementById('obs-cd-txt');
+  const circ = 2 * Math.PI * 9;
+  const frac = Math.max(0, remaining / total);
+  arc.setAttribute('stroke-dashoffset', String(circ * (1 - frac)));
+  txt.textContent = Math.ceil(remaining) + 's';
+}
+function _clearObstacleCountdown() {
+  const wrap = document.getElementById('obs-countdown-wrap');
+  if (wrap) wrap.remove();
 }
 
 async function refreshStatus() {
@@ -604,10 +807,10 @@ async function drawMap(meta) {
 
   const toC = p => ({ x: (p.x / meta.width) * cw, y: (p.y / meta.height) * ch });
 
-  // Grid
+  // Grid (every 1 m = 20 cells at 0.05 m/cell)
   const step = Math.max(10, Math.round(1.0 / meta.resolution));
   mapCtx.save();
-  mapCtx.strokeStyle = 'rgba(255,255,255,0.05)'; mapCtx.lineWidth = 1;
+  mapCtx.strokeStyle = 'rgba(255,255,255,0.04)'; mapCtx.lineWidth = 1;
   for (let x = 0; x <= meta.width; x += step) {
     const px = (x / meta.width) * cw;
     mapCtx.beginPath(); mapCtx.moveTo(px, 0); mapCtx.lineTo(px, ch); mapCtx.stroke();
@@ -630,9 +833,7 @@ async function drawMap(meta) {
     mapCtx.strokeStyle = '#38bdf8'; mapCtx.lineWidth = 3;
     mapCtx.shadowColor = 'rgba(56,189,248,0.4)'; mapCtx.shadowBlur = 12;
     mapCtx.beginPath();
-    meta.path.forEach((p, i) => {
-      const c = toC(p); if (i === 0) mapCtx.moveTo(c.x, c.y); else mapCtx.lineTo(c.x, c.y);
-    });
+    meta.path.forEach((p, i) => { const c = toC(p); if (i === 0) mapCtx.moveTo(c.x, c.y); else mapCtx.lineTo(c.x, c.y); });
     mapCtx.stroke(); mapCtx.restore();
   }
 
@@ -649,17 +850,91 @@ async function drawMap(meta) {
     mapCtx.stroke(); mapCtx.restore();
   }
 
-  // Robot
-  if (meta.pose) {
-    const c = toC(meta.pose); const th = meta.pose.theta; const r = 10;
+  // POIs
+  const pois = meta.pois || [];
+  pois.forEach(poi => {
+    const cx = (poi.px / meta.width)  * cw;
+    const cy = (poi.py / meta.height) * ch;
+    // Halo
     mapCtx.save();
-    mapCtx.translate(c.x, c.y); mapCtx.rotate(th);
+    mapCtx.fillStyle = 'rgba(251,191,36,0.18)';
+    mapCtx.beginPath(); mapCtx.arc(cx, cy, 14, 0, Math.PI*2); mapCtx.fill();
+    // Border ring
+    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 2;
+    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 8;
+    mapCtx.beginPath(); mapCtx.arc(cx, cy, 10, 0, Math.PI*2); mapCtx.stroke();
+    mapCtx.restore();
+    // Icon emoji
+    mapCtx.font = '13px sans-serif';
+    mapCtx.textAlign = 'center'; mapCtx.textBaseline = 'middle';
+    const icons = { gazebo:'⛺', waypoint:'📍', dock:'🔌', custom:'⭐' };
+    mapCtx.fillText(icons[poi.kind] || '⭐', cx, cy);
+    // Label below
+    mapCtx.save();
+    mapCtx.font = 'bold 9px sans-serif';
+    mapCtx.fillStyle = '#fbbf24';
+    mapCtx.textAlign = 'center'; mapCtx.textBaseline = 'top';
+    mapCtx.shadowColor = '#000'; mapCtx.shadowBlur = 3;
+    mapCtx.fillText(poi.label, cx, cy + 12);
+    mapCtx.restore();
+  });
+
+  // Robot — scaled rectangle matching physical body (520×500 mm)
+  // In map pixel space: pixPerM = cw / (meta.width * meta.resolution)
+  if (meta.pose) {
+    const c   = toC(meta.pose);
+    const th  = meta.pose.theta;
+    const ppm = cw / (meta.width * (meta.resolution || 0.05));  // pixels per metre
+    const rL  = 0.520 / 2 * ppm;   // half-length px (front-back)
+    const rW  = 0.500 / 2 * ppm;   // half-width  px (left-right)
+    mapCtx.save();
+    mapCtx.translate(c.x, c.y);
+    // Map convention: x=right, y=down on canvas; robot x=fwd mapped to canvas x=right at theta=0
+    mapCtx.rotate(th);
+    // Body fill
+    mapCtx.fillStyle = 'rgba(56,189,248,0.12)';
+    mapCtx.fillRect(-rW, -rL, rW * 2, rL * 2);
+    // Body outline
+    mapCtx.strokeStyle = 'rgba(56,189,248,0.55)'; mapCtx.lineWidth = 1.5;
+    mapCtx.strokeRect(-rW, -rL, rW * 2, rL * 2);
+    // Front edge (green)
+    mapCtx.strokeStyle = '#34d399'; mapCtx.lineWidth = 2.5;
+    mapCtx.shadowColor = 'rgba(52,211,153,0.5)'; mapCtx.shadowBlur = 8;
+    mapCtx.beginPath(); mapCtx.moveTo(-rW, rL); mapCtx.lineTo(rW, rL); mapCtx.stroke();
+    mapCtx.shadowBlur = 0;
+    // Direction arrow
     mapCtx.fillStyle = '#38bdf8';
-    mapCtx.shadowColor = 'rgba(56,189,248,0.6)'; mapCtx.shadowBlur = 14;
+    mapCtx.shadowColor = 'rgba(56,189,248,0.6)'; mapCtx.shadowBlur = 10;
     mapCtx.beginPath();
-    mapCtx.moveTo(r, 0); mapCtx.lineTo(-r*0.7, -r*0.6); mapCtx.lineTo(-r*0.7, r*0.6);
-    mapCtx.closePath(); mapCtx.fill(); mapCtx.restore();
+    const ar = Math.max(3, rL * 0.55);
+    mapCtx.moveTo(0, rL - ar * 0.2); mapCtx.lineTo(-ar * 0.5, rL - ar); mapCtx.lineTo(ar * 0.5, rL - ar);
+    mapCtx.closePath(); mapCtx.fill();
+    mapCtx.shadowBlur = 0;
+    mapCtx.restore();
   }
+
+  // ── Scale bar with dual units ────────────────────────────────────────────────
+  const pixelsPerM = cw / (meta.width * (meta.resolution || 0.05));
+  mapCtx.save();
+  // 1 m bar
+  const bar1m = 1 * pixelsPerM;
+  mapCtx.fillStyle = 'rgba(255,255,255,0.85)'; mapCtx.globalAlpha = 1;
+  mapCtx.fillRect(12, ch - 24, bar1m, 3);
+  mapCtx.fillStyle = 'rgba(255,255,255,0.70)';
+  mapCtx.fillRect(12, ch - 19, bar1m * 0.5, 2);  // 50 cm half-bar
+  mapCtx.font = '8px monospace'; mapCtx.textAlign = 'left'; mapCtx.fillStyle = 'rgba(255,255,255,0.75)';
+  mapCtx.fillText('50cm', 12 + bar1m * 0.5 + 2, ch - 17);
+  mapCtx.fillText('1 m',  12 + bar1m + 2,        ch - 22);
+  // 5 m bar
+  const bar5m = 5 * pixelsPerM;
+  mapCtx.fillStyle = 'rgba(56,189,248,0.55)';
+  mapCtx.fillRect(12, ch - 12, bar5m, 3);
+  mapCtx.fillStyle = 'rgba(56,189,248,0.70)';
+  mapCtx.fillText('5 m', 12 + bar5m + 2, ch - 10);
+  // Grid info
+  mapCtx.fillStyle = 'rgba(99,130,180,0.45)'; mapCtx.textAlign = 'right';
+  mapCtx.fillText(`${(meta.resolution || 0.05)*100|0} cm/cell`, cw - 8, ch - 8);
+  mapCtx.restore();
 }
 
 // ── Lidar render ──────────────────────────────────────────────────────────────
@@ -668,7 +943,6 @@ async function refreshLidar() {
     const data = await api('/api/lidar');
     drawRadar(data);
     drawScene(data);
-    // Avoidance badge
     const hasRoute = data.obstacle_stop && data.avoidance_route?.length > 0;
     EL.avoidBadge.style.display = hasRoute ? '' : 'none';
   } catch (_) {}
@@ -678,178 +952,247 @@ function drawRadar(data) {
   const cw = EL.radarCanvas.width, ch = EL.radarCanvas.height;
   const cx = cw / 2, cy = ch / 2;
   const maxRange = data.max_range || 8.0;
-  const scale = (Math.min(cw, ch) / 2 - 14) / maxRange;
+  const scale = (Math.min(cw, ch) / 2 - 14) / maxRange;   // px per metre
 
   radarCtx.clearRect(0, 0, cw, ch);
   radarCtx.fillStyle = '#0d1422';
   radarCtx.fillRect(0, 0, cw, ch);
 
-  // Range rings
-  radarCtx.lineWidth = 1;
-  [2, 4, 6, 8].forEach(r => {
-    radarCtx.strokeStyle = 'rgba(99,130,180,0.18)';
-    radarCtx.beginPath(); radarCtx.arc(cx, cy, r * scale, 0, Math.PI * 2); radarCtx.stroke();
-    radarCtx.fillStyle = 'rgba(99,130,180,0.50)';
-    radarCtx.font = '9px sans-serif';
-    radarCtx.fillText(`${r}m`, cx + r * scale + 2, cy - 2);
+  // ── Distance rings ─────────────────────────────────────────────────────────
+  // Inner rings: 50 cm, 100 cm, 150 cm  → labelled in centimetres
+  // Outer rings: 2 m … 8 m              → labelled in metres
+  [
+    { r: 0.5,  lbl: '50 cm',  dash: [4,4], col: 'rgba(251,191,36,0.22)',   tc: 'rgba(251,191,36,0.75)' },
+    { r: 1.0,  lbl: '100 cm', dash: [],    col: 'rgba(120,150,200,0.28)',  tc: 'rgba(140,175,230,0.75)' },
+    { r: 1.5,  lbl: '150 cm', dash: [],    col: 'rgba(99,130,180,0.20)',   tc: 'rgba(140,175,230,0.60)' },
+    { r: 2,    lbl: '2 m',    dash: [],    col: 'rgba(99,130,180,0.16)',   tc: 'rgba(99,130,180,0.50)' },
+    { r: 3,    lbl: '3 m',    dash: [],    col: 'rgba(99,130,180,0.14)',   tc: 'rgba(99,130,180,0.45)' },
+    { r: 4,    lbl: '4 m',    dash: [],    col: 'rgba(99,130,180,0.14)',   tc: 'rgba(99,130,180,0.45)' },
+    { r: 5,    lbl: '5 m',    dash: [],    col: 'rgba(99,130,180,0.13)',   tc: 'rgba(99,130,180,0.40)' },
+    { r: 6,    lbl: '6 m',    dash: [],    col: 'rgba(99,130,180,0.13)',   tc: 'rgba(99,130,180,0.40)' },
+    { r: 8,    lbl: '8 m',    dash: [],    col: 'rgba(99,130,180,0.12)',   tc: 'rgba(99,130,180,0.38)' },
+  ].forEach(({ r, lbl, dash, col, tc }) => {
+    const rPx = r * scale;
+    if (rPx > Math.min(cw, ch) / 2 - 4) return;
+    radarCtx.setLineDash(dash);
+    radarCtx.strokeStyle = col;
+    radarCtx.lineWidth = 1;
+    radarCtx.beginPath();
+    radarCtx.arc(cx, cy, rPx, 0, Math.PI * 2);
+    radarCtx.stroke();
+    radarCtx.setLineDash([]);
+    radarCtx.fillStyle = tc;
+    radarCtx.font = r < 2 ? '8px monospace' : '9px sans-serif';
+    radarCtx.textAlign = 'left';
+    radarCtx.fillText(lbl, cx + rPx + 3, cy - 3);
   });
 
   // Crosshairs
-  radarCtx.strokeStyle = 'rgba(99,130,180,0.22)';
+  radarCtx.strokeStyle = 'rgba(99,130,180,0.18)';
+  radarCtx.lineWidth = 1;
   radarCtx.beginPath();
-  radarCtx.moveTo(cx, 5);    radarCtx.lineTo(cx, ch-5);
-  radarCtx.moveTo(5, cy);    radarCtx.lineTo(cw-5, cy);
+  radarCtx.moveTo(cx, 4); radarCtx.lineTo(cx, ch - 4);
+  radarCtx.moveTo(4, cy); radarCtx.lineTo(cw - 4, cy);
   radarCtx.stroke();
 
   // ── Avoidance route ────────────────────────────────────────────────────────
-  // Robot frame: x=forward, y=left (+y = left of robot)
-  // On radar canvas: forward = UP (−y on screen), left = LEFT (−x on screen)
-  //   screen_x = cx  − robot_y * scale   (left on robot → left on screen)
-  //   screen_y = cy  − robot_x * scale   (forward on robot → up on screen)
   const route = data.avoidance_route;
   if (data.obstacle_stop && route?.length >= 2) {
     radarCtx.save();
-    radarCtx.strokeStyle = '#fbbf24';
-    radarCtx.lineWidth = 2.5;
-    radarCtx.setLineDash([7, 4]);
-    radarCtx.shadowColor = 'rgba(251,191,36,0.6)';
-    radarCtx.shadowBlur  = 10;
-    radarCtx.beginPath();
-    radarCtx.moveTo(cx, cy);  // robot origin
-    route.forEach(wp => {
-      const sx = cx - wp.y * scale;
-      const sy = cy - wp.x * scale;
-      radarCtx.lineTo(sx, sy);
-    });
-    radarCtx.stroke();
-    radarCtx.setLineDash([]);
-    radarCtx.shadowBlur = 0;
-
-    // Waypoint dots
+    radarCtx.strokeStyle = '#fbbf24'; radarCtx.lineWidth = 2.5; radarCtx.setLineDash([7, 4]);
+    radarCtx.shadowColor = 'rgba(251,191,36,0.6)'; radarCtx.shadowBlur = 10;
+    radarCtx.beginPath(); radarCtx.moveTo(cx, cy);
+    route.forEach(wp => radarCtx.lineTo(cx - wp.y * scale, cy - wp.x * scale));
+    radarCtx.stroke(); radarCtx.setLineDash([]); radarCtx.shadowBlur = 0;
     radarCtx.fillStyle = '#fbbf24';
     route.forEach((wp, i) => {
-      const sx = cx - wp.y * scale;
-      const sy = cy - wp.x * scale;
-      radarCtx.beginPath();
-      radarCtx.arc(sx, sy, i === route.length - 1 ? 5 : 3.5, 0, Math.PI * 2);
-      radarCtx.fill();
+      const sx = cx - wp.y * scale, sy = cy - wp.x * scale;
+      radarCtx.beginPath(); radarCtx.arc(sx, sy, i === route.length - 1 ? 5 : 3.5, 0, Math.PI * 2); radarCtx.fill();
     });
-
-    // Direction label
     const side = route[0]?.side || (route[0]?.y > 0 ? 'left' : 'right');
-    radarCtx.fillStyle = '#fbbf24';
-    radarCtx.font = 'bold 10px sans-serif';
-    radarCtx.fillText(`DETOUR ${side.toUpperCase()}`, cx - 36, 18);
+    radarCtx.font = 'bold 10px sans-serif'; radarCtx.textAlign = 'center';
+    radarCtx.fillText(`DETOUR ${side.toUpperCase()}`, cx, 18);
     radarCtx.restore();
   }
 
   // ── Scan points ────────────────────────────────────────────────────────────
   if (data.points?.length) {
-    // Scan points from API are cartesian {x, y} in robot frame already
-    // (x=forward, y=left from lidar.scan_cartesian)
     radarCtx.fillStyle = data.obstacle_stop ? '#f87171' : '#34d399';
     data.points.forEach(p => {
-      const sx = cx - p.y * scale;   // y=left → left on screen
-      const sy = cy - p.x * scale;   // x=forward → up on screen
+      const sx = cx - p.y * scale, sy = cy - p.x * scale;
       radarCtx.fillRect(sx - 1.5, sy - 1.5, 3, 3);
     });
   }
 
-  // Obstacle stop zone arc
+  // Obstacle stop-zone arc
   if (data.obstacle_stop) {
     radarCtx.save();
-    radarCtx.strokeStyle = 'rgba(248,113,113,0.5)';
-    radarCtx.lineWidth = 1.5;
-    radarCtx.setLineDash([3, 3]);
+    radarCtx.strokeStyle = 'rgba(248,113,113,0.50)'; radarCtx.lineWidth = 1.5; radarCtx.setLineDash([3, 3]);
     const stopR = 0.35 * scale;
-    // Arc in front of robot (upward on canvas = forward direction)
-    radarCtx.beginPath();
-    radarCtx.arc(cx, cy, stopR, -Math.PI * 0.75, -Math.PI * 0.25);
-    radarCtx.stroke();
+    radarCtx.beginPath(); radarCtx.arc(cx, cy, stopR, -Math.PI * 0.75, -Math.PI * 0.25); radarCtx.stroke();
     radarCtx.setLineDash([]);
-    radarCtx.fillStyle = '#f87171';
-    radarCtx.font = 'bold 9px sans-serif';
-    radarCtx.fillText('BLOCKED', cx - 22, cy - stopR - 5);
+    radarCtx.fillStyle = '#f87171'; radarCtx.font = 'bold 9px sans-serif'; radarCtx.textAlign = 'center';
+    radarCtx.fillText('BLOCKED', cx, cy - stopR - 5);
     radarCtx.restore();
   }
 
-  // Robot dot
-  radarCtx.fillStyle = '#38bdf8';
-  radarCtx.shadowColor = '#38bdf8'; radarCtx.shadowBlur = 8;
-  radarCtx.beginPath(); radarCtx.arc(cx, cy, 5, 0, Math.PI * 2); radarCtx.fill();
+  // ── Rover physical footprint ───────────────────────────────────────────────
+  // Rover: 520 × 500 × 300 mm  |  Wheels: 120 mm dia, 400 mm track
+  // LiDAR: 240 mm forward of rover centre, laterally centred
+  //
+  // Radar screen convention (robot frame):
+  //   screen_x = cx − robot_y × scale   (left=+y → left on screen)
+  //   screen_y = cy − robot_x × scale   (fwd=+x  → up on screen)
+  const ROVER_L   = 0.520;    // m, front–back
+  const ROVER_W   = 0.500;    // m, left–right
+  const WHEEL_D   = 0.120;    // m, wheel diameter
+  const WHEEL_TRK = 0.400;    // m, wheel centre-to-centre
+  const LIDAR_FWD = 0.240;    // m, lidar forward offset from rover centre
+
+  const hL      = ROVER_L   / 2 * scale;    // half-length px
+  const hW      = ROVER_W   / 2 * scale;    // half-width  px
+  const wheelR  = WHEEL_D   / 2 * scale;    // wheel radius px
+  const wheelOff = WHEEL_TRK / 2 * scale;  // lateral offset px
+
+  radarCtx.save();
+
+  // Body fill
+  radarCtx.fillStyle = 'rgba(56,189,248,0.07)';
+  radarCtx.fillRect(cx - hW, cy - hL, hW * 2, hL * 2);
+
+  // Body border
+  radarCtx.strokeStyle = 'rgba(56,189,248,0.48)';
+  radarCtx.lineWidth = 1.5;
+  radarCtx.strokeRect(cx - hW, cy - hL, hW * 2, hL * 2);
+
+  // Front edge — bright green
+  radarCtx.strokeStyle = '#34d399';
+  radarCtx.lineWidth = 2.5;
+  radarCtx.shadowColor = 'rgba(52,211,153,0.45)'; radarCtx.shadowBlur = 6;
+  radarCtx.beginPath();
+  radarCtx.moveTo(cx - hW, cy - hL); radarCtx.lineTo(cx + hW, cy - hL);
+  radarCtx.stroke(); radarCtx.shadowBlur = 0;
+
+  // Wheels (left = left on screen, right = right on screen)
+  [['L', cx - wheelOff], ['R', cx + wheelOff]].forEach(([lbl, wx]) => {
+    radarCtx.fillStyle   = 'rgba(100,116,139,0.22)';
+    radarCtx.strokeStyle = 'rgba(148,163,184,0.70)';
+    radarCtx.lineWidth   = 1.5;
+    radarCtx.beginPath(); radarCtx.arc(wx, cy, wheelR, 0, Math.PI * 2);
+    radarCtx.fill(); radarCtx.stroke();
+    // tiny label
+    radarCtx.fillStyle = 'rgba(148,163,184,0.55)';
+    radarCtx.font = '6px sans-serif'; radarCtx.textAlign = 'center';
+    radarCtx.fillText(lbl, wx, cy + 2);
+    // wheel diameter callout (once, left wheel)
+    if (lbl === 'L') {
+      radarCtx.fillStyle = 'rgba(100,116,139,0.55)';
+      radarCtx.font = '6px monospace'; radarCtx.textAlign = 'right';
+      radarCtx.fillText(`⌀${Math.round(WHEEL_D*100)}cm`, wx - wheelR - 2, cy - 2);
+    }
+  });
+
+  // Axle line
+  radarCtx.strokeStyle = 'rgba(148,163,184,0.25)'; radarCtx.lineWidth = 1;
+  radarCtx.setLineDash([2, 3]);
+  radarCtx.beginPath(); radarCtx.moveTo(cx - wheelOff, cy); radarCtx.lineTo(cx + wheelOff, cy);
+  radarCtx.stroke(); radarCtx.setLineDash([]);
+
+  // LiDAR position dot
+  const lidarSY = cy - LIDAR_FWD * scale;
+  radarCtx.fillStyle = '#fbbf24'; radarCtx.shadowColor = '#fbbf24'; radarCtx.shadowBlur = 8;
+  radarCtx.beginPath(); radarCtx.arc(cx, lidarSY, 3.5, 0, Math.PI * 2); radarCtx.fill();
   radarCtx.shadowBlur = 0;
 
-  // "UP = FORWARD" label
+  // LiDAR label
+  radarCtx.fillStyle = 'rgba(251,191,36,0.65)';
+  radarCtx.font = '6px monospace'; radarCtx.textAlign = 'left';
+  radarCtx.fillText('LiDAR', cx + 5, lidarSY - 4);
+
+  // Dimension callout — width
+  radarCtx.fillStyle = 'rgba(56,189,248,0.50)';
+  radarCtx.font = '7px monospace'; radarCtx.textAlign = 'center';
+  radarCtx.fillText(`◀${Math.round(ROVER_W*100)} cm▶`, cx, cy + hL + 10);
+
+  // Dimension callout — length
+  radarCtx.textAlign = 'right';
+  radarCtx.fillText(`${Math.round(ROVER_L*100)}cm`, cx - hW - 3, cy);
+
+  // "FRONT" label
+  radarCtx.fillStyle = '#34d399'; radarCtx.font = 'bold 7px sans-serif'; radarCtx.textAlign = 'center';
+  radarCtx.fillText('▲ FRONT', cx, cy - hL - 5);
+
+  radarCtx.restore();
+
+  // Centre dot (rover origin)
+  radarCtx.fillStyle = '#38bdf8'; radarCtx.shadowColor = '#38bdf8'; radarCtx.shadowBlur = 8;
+  radarCtx.beginPath(); radarCtx.arc(cx, cy, 2.5, 0, Math.PI * 2); radarCtx.fill();
+  radarCtx.shadowBlur = 0;
+
   radarCtx.fillStyle = 'rgba(99,130,180,0.45)';
-  radarCtx.font = '8px sans-serif';
+  radarCtx.font = '8px sans-serif'; radarCtx.textAlign = 'left';
   radarCtx.fillText('▲ FWD', cx - 12, 10);
 }
 
 function drawScene(data) {
   const cw = EL.sceneCanvas.width, ch = EL.sceneCanvas.height;
   const maxRange = data.max_range || 8.0;
-
   sceneCtx.clearRect(0, 0, cw, ch);
-
   const grad = sceneCtx.createLinearGradient(0, 0, 0, ch);
   grad.addColorStop(0, '#0d1b2e'); grad.addColorStop(1, '#1a2a1a');
   sceneCtx.fillStyle = grad; sceneCtx.fillRect(0, 0, cw, ch);
-
   const horizon = ch * 0.55;
   sceneCtx.strokeStyle = 'rgba(56,189,248,0.15)'; sceneCtx.lineWidth = 1;
   sceneCtx.beginPath(); sceneCtx.moveTo(0, horizon); sceneCtx.lineTo(cw, horizon); sceneCtx.stroke();
-
   sceneCtx.strokeStyle = 'rgba(56,189,248,0.06)';
   for (let i = 0; i < 20; i++) {
     const y = horizon + (i / 20) * (ch - horizon);
     sceneCtx.beginPath(); sceneCtx.moveTo(0, y); sceneCtx.lineTo(cw, y); sceneCtx.stroke();
   }
-
   if (data.points?.length) {
     data.points.forEach(p => {
-      // p.x = forward, p.y = left (robot frame)
       const dist = Math.hypot(p.x, p.y);
       if (dist < 0.05 || dist > maxRange) return;
-      // angle from forward axis
       const angle = Math.atan2(p.y, p.x);
       const normAngle = angle / (Math.PI / 2);
-      const screenX = cw * (0.5 - normAngle * 0.55); // left=+y → left on screen
+      const screenX = cw * (0.5 - normAngle * 0.55);
       const relDist  = dist / maxRange;
       const screenY  = horizon - (1 - relDist) * horizon * 0.9;
       const dotSize  = Math.max(1.5, (1 - relDist) * 8);
       const isObs    = data.obstacle_stop && Math.abs(angle) < 0.44 && dist < 0.45;
-      sceneCtx.fillStyle    = isObs ? '#f87171' : '#34d399';
-      sceneCtx.globalAlpha  = 0.5 + relDist * 0.5;
+      sceneCtx.fillStyle   = isObs ? '#f87171' : '#34d399';
+      sceneCtx.globalAlpha = 0.5 + relDist * 0.5;
       sceneCtx.fillRect(screenX - dotSize/2, screenY - dotSize/2, dotSize, dotSize);
     });
     sceneCtx.globalAlpha = 1;
   }
-
-  // Detour label on scene
   if (data.obstacle_stop && data.avoidance_route?.length) {
     const side = data.avoidance_route[0]?.side || (data.avoidance_route[0]?.y > 0 ? 'left' : 'right');
     const arrow = side === 'left' ? '← DETOUR LEFT' : 'DETOUR RIGHT →';
-    sceneCtx.fillStyle    = '#fbbf24';
-    sceneCtx.font         = 'bold 14px sans-serif';
-    sceneCtx.globalAlpha  = 0.90;
-    sceneCtx.fillText(arrow, cw / 2 - 64, horizon - 20);
+    sceneCtx.fillStyle = '#fbbf24'; sceneCtx.font = 'bold 14px sans-serif';
+    sceneCtx.globalAlpha = 0.90; sceneCtx.fillText(arrow, cw/2 - 64, horizon - 20);
     sceneCtx.globalAlpha = 1;
   }
 }
 
-// ── Poll loops ────────────────────────────────────────────────────────────────
-function debounced(fn, ms) {
-  let timer = null;
-  const run = async () => {
+// ── Poll loops (sequential debounce — no overlapping fetches) ─────────────────
+// v4 fix: each loop awaits the previous call before scheduling the next tick,
+// so a slow map payload render never blocks the faster status/lidar ticks.
+function seqLoop(fn, ms) {
+  async function run() {
     try { await fn(); } catch (_) {}
-    timer = setTimeout(run, ms);
-  };
+    setTimeout(run, ms);
+  }
   run();
 }
 
-debounced(refreshStatus,       450);
-debounced(refreshMap,          900);
-debounced(refreshLidar,        260);
-debounced(refreshCameraStatus, 2000);
+seqLoop(refreshStatus,       450);
+seqLoop(refreshMap,          950);
+seqLoop(refreshLidar,        260);
+seqLoop(refreshCameraStatus, 2000);
+seqLoop(refreshPois,         5000);
 refreshMapList();
 setInterval(refreshMapList, 10000);
+
+// Initialise map canvas cursor and tool hint
+setTool('goal');

@@ -66,8 +66,8 @@ cameras = CameraManager()
 _SPEED_MAP = {
     "forward": (1.0,  0.0),
     "back":    (-1.0, 0.0),
-    "left":    (0.0, -1.0),
-    "right":   (0.0,  1.0),
+    "left":    (0.0,  1.0),   # positive angular = turn left
+    "right":   (0.0, -1.0),   # negative angular = turn right
     "stop":    (0.0,  0.0),
 }
 
@@ -163,6 +163,54 @@ def api_nav_goal():
 def api_nav_cancel():
     runtime.cancel_navigation()
     return jsonify({"ok": True})
+
+
+# ── POI / Waypoint routes ─────────────────────────────────────────────────────
+
+@app.route("/api/poi", methods=["GET"])
+def api_poi_list():
+    return jsonify({"pois": runtime.poi_list()})
+
+
+@app.route("/api/poi", methods=["POST"])
+def api_poi_add():
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "JSON body required"}), 400
+    data = request.json
+    try:
+        label = str(data.get("label", "Waypoint"))
+        kind  = str(data.get("kind",  "waypoint"))
+        x     = float(data["x"])
+        y     = float(data["y"])
+        note  = str(data.get("note", ""))
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    poi = runtime.poi_add(label, kind, x, y, note)
+    return jsonify({"ok": True, "poi": poi})
+
+
+@app.route("/api/poi/<poi_id>", methods=["PATCH"])
+def api_poi_update(poi_id: str):
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "JSON body required"}), 400
+    updated = runtime.poi_update(poi_id, **request.json)
+    if updated is None:
+        return jsonify({"ok": False, "error": "POI not found"}), 404
+    return jsonify({"ok": True, "poi": updated})
+
+
+@app.route("/api/poi/<poi_id>", methods=["DELETE"])
+def api_poi_delete(poi_id: str):
+    if runtime.poi_remove(poi_id):
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "POI not found"}), 404
+
+
+@app.route("/api/poi/<poi_id>/navigate", methods=["POST"])
+def api_poi_navigate(poi_id: str):
+    if runtime.poi_navigate(poi_id):
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "POI not found"}), 404
 
 
 @app.route("/api/pose", methods=["POST"])

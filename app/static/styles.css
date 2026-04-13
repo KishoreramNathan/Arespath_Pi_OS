@@ -476,3 +476,138 @@ i.lg.path     { background: var(--accent); }
   border-radius: var(--radius-sm);
   box-shadow: 0 8px 60px rgba(0,0,0,0.8);
 }
+
+/* ── v4 additions ──────────────────────────────────────────────────────────── */
+
+/* Tool segmented — 4 buttons */
+.segmented.four { grid-template-columns: repeat(4, 1fr); }
+
+/* Zoom controls */
+.icon-btn { min-width: 36px; padding: 0 6px; font-size: 16px; }
+.zoom-label { font-size: 11px; color: var(--text-dim); align-self: center; margin-left: 4px; }
+
+/* ICP pill */
+#icp-pill { font-size: 10px; letter-spacing: 0.04em; }
+
+/* Map outer wrapper — clips during pan */
+.map-outer {
+  width: 100%;
+  overflow: hidden;
+  position: relative;
+  border-radius: var(--radius-sm);
+  background: #1a2236;
+  touch-action: none;
+}
+.map-outer canvas {
+  display: block;
+  width: 100%;
+  max-width: 820px;
+  transition: transform 0.05s linear;
+  transform-origin: 50% 50%;
+}
+
+/* Map size badge */
+.map-size-badge {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-dim);
+  background: rgba(56,189,248,0.10);
+  border: 1px solid rgba(56,189,248,0.18);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+/* Legend POI swatch */
+.lg.poi-leg { background: #fbbf24; }
+
+/* POI sidebar list */
+.poi-sidebar-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.poi-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+.poi-icon { font-size: 14px; flex-shrink: 0; }
+.poi-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.poi-nav-btn,
+.poi-edit-btn {
+  padding: 2px 7px;
+  font-size: 11px;
+  min-width: unset;
+}
+
+/* POI modals */
+.modal-sm { max-width: 400px; }
+.poi-form {
+  padding: 14px 18px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.poi-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.poi-form input,
+.poi-form select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 6px 10px;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.poi-form input:focus,
+.poi-form select:focus { border-color: var(--accent); }
+.poi-coords-preview {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.poi-coords-preview strong { color: var(--accent); }
+
+/* Button full-width helper */
+button.full { width: 100%; }
+
+/* ── v4.1 additions ────────────────────────────────────────────────────────── */
+
+/* Obstacle countdown SVG ring in conn-bar */
+#obs-countdown-wrap {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+#obs-countdown-ring {
+  filter: drop-shadow(0 0 4px rgba(251,191,36,0.5));
+}
+
+/* Mission status highlight colours (set via JS inline style) */
+#st-nav { transition: color 0.3s; }
+
+/* Nav-status waiting flash */
+@keyframes navWait {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.55; }
+}
+.nav-waiting { animation: navWait 1s ease-in-out infinite; }

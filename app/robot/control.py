@@ -19,8 +19,9 @@ from typing import List, Optional, Tuple
 
 from app import config
 from app.robot.command_bus import DriveCommandQueue
-from app.robot.lidar import LidarManager
+from app.robot.lidar import LidarLocalizer, LidarManager
 from app.robot.mapping import OccupancyGridMap
+from app.robot.poi import PoiManager
 from app.robot.planner import astar, inflate_occupancy, simplify_path
 from app.robot.serial_bridge import ArduinoBridge
 from app.robot.state import NavigationState, Pose, RobotState, wrap_angle
@@ -33,8 +34,10 @@ class RobotRuntime:
         self.state = RobotState()
         self.map = OccupancyGridMap()
         self.lidar = LidarManager()
+        self.localizer = LidarLocalizer()
         self.bridge = ArduinoBridge(on_telemetry=self._on_telemetry)
         self.queue = DriveCommandQueue(self.bridge)
+        self.poi = PoiManager(config.POIS_FILE)
         self.lock = threading.Lock()
 
         self._running = False
@@ -50,6 +53,10 @@ class RobotRuntime:
 
         # Frontend heartbeat watchdog
         self._last_heartbeat: float = time.time()
+
+        # Obstacle avoidance recovery state
+        self._obstacle_reverse_until: float = 0.0   # time.time() deadline for reverse
+        self._obstacle_blocked_at:    float = 0.0   # when we first got blocked
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -185,12 +192,14 @@ class RobotRuntime:
         with self.lock:
             self.map.clear()
             self.state.nav.path = []
+        self.localizer.reset()   # reset ICP reference so stale scan doesn't corrupt new map
 
     def save_map(self, name: str) -> dict:
         return self.map.save(name)
 
     def load_map(self, name: str) -> None:
         self.map.load(name)
+        self.localizer.reset()
 
     def set_pose(self, x: float, y: float, theta: float) -> None:
         with self.lock:
@@ -199,6 +208,30 @@ class RobotRuntime:
             self._last_ticks = None
             self._last_tel_ts = None
             self.state.nav.status = "start pose updated"
+        self.localizer.reset()   # new pose → drop old ICP reference
+
+    # ── POI / waypoint API (delegates to PoiManager) ─────────────────────────
+
+    def poi_add(self, label: str, kind: str, x: float, y: float,
+                note: str = "") -> dict:
+        return self.poi.add(label, kind, x, y, note)
+
+    def poi_update(self, poi_id: str, **fields) -> Optional[dict]:
+        return self.poi.update(poi_id, **fields)
+
+    def poi_remove(self, poi_id: str) -> bool:
+        return self.poi.remove(poi_id)
+
+    def poi_list(self) -> list:
+        return self.poi.list()
+
+    def poi_navigate(self, poi_id: str) -> bool:
+        """Set navigation goal to the POI's location."""
+        coords = self.poi.navigate_to(poi_id)
+        if coords is None:
+            return False
+        self.set_goal(coords[0], coords[1])
+        return True
 
     # ── Status / data API ─────────────────────────────────────────────────────
 
@@ -207,7 +240,15 @@ class RobotRuntime:
             self.state.lidar_connected = self.lidar.connected
             self.state.latest_scan_points = len(self.lidar.get_scan())
             self.state.last_error = self.bridge.last_error or self.state.last_error
-            return self.state.to_dict()
+            s = self.state.to_dict()
+        # Obstacle countdown (seconds remaining before forced replan)
+        if self._obstacle_blocked_at > 0:
+            elapsed   = time.time() - self._obstacle_blocked_at
+            remaining = max(0.0, config.OBSTACLE_WAIT_BEFORE_REPLAN_S - elapsed)
+            s["obstacle_wait_remaining_s"] = round(remaining, 1)
+        else:
+            s["obstacle_wait_remaining_s"] = None
+        return s
 
     def get_lidar_payload(self) -> dict:
         with self.lock:
@@ -286,22 +327,37 @@ class RobotRuntime:
     def get_map_payload(self) -> dict:
         with self.lock:
             scan_px = self._scan_to_map_pixels(self.lidar.get_scan())
-            return self.map.map_payload(
+            payload = self.map.map_payload(
                 self.state.pose,
                 self.state.nav.path,
                 self.state.nav.goal,
                 scan_px=scan_px,
             )
+        # Add POIs as pixel coordinates for canvas rendering
+        pois_px = []
+        for poi in self.poi.list():
+            gx, gy = self.map.world_to_grid(poi["x"], poi["y"])
+            pois_px.append({**poi, "px": gx, "py": gy})
+        payload["pois"] = pois_px
+        return payload
 
     def _scan_to_map_pixels(self, scan: List[Tuple[float, float]]) -> list:
+        """Convert live lidar scan to map pixel coordinates.
+
+        Uses the same world→grid transform as OccupancyGridMap.update_from_scan
+        so live scan dots align exactly with the mapped obstacles.
+        """
         out = []
         if not scan:
             return out
-        step = max(1, len(scan) // 180)
+        step = max(1, len(scan) // 360)   # up to 360 points for density
         pose = self.state.pose
         for angle, dist in scan[::step]:
-            wx = pose.x + dist * math.cos(pose.theta + angle)
-            wy = pose.y + dist * math.sin(pose.theta + angle)
+            if dist <= 0:
+                continue
+            global_angle = pose.theta + angle
+            wx = pose.x + dist * math.cos(global_angle)
+            wy = pose.y + dist * math.sin(global_angle)
             gx, gy = self.map.world_to_grid(wx, wy)
             if self.map.in_bounds(gx, gy):
                 out.append({"x": gx, "y": gy})
@@ -310,24 +366,87 @@ class RobotRuntime:
     # ── 20 Hz control loop ────────────────────────────────────────────────────
 
     def _ctrl_loop(self) -> None:
+        """20 Hz control loop.
+
+        Fixes vs v3
+        ───────────
+        * Map updates run in a separate daemon thread so heavy numpy work
+          never blocks the 20 Hz control tick → eliminates UI glitch when
+          mapping + pilot control run simultaneously.
+        * ICP localization is applied outside the main lock so it cannot
+          starve the telemetry callback thread.
+        * Obstacle detection and nav/pilot dispatch always run, regardless
+          of LIDAR_LOCALIZATION_ENABLED state.
+        """
+        import queue as _queue
+
+        # Dedicated map-update worker (decouples heavy numpy from ctrl tick)
+        _map_q: "_queue.Queue[tuple]" = _queue.Queue(maxsize=2)
+
+        def _map_worker() -> None:
+            while self._running:
+                try:
+                    pose_snap, scan_snap = _map_q.get(timeout=0.5)
+                    self.map.update_from_scan(pose_snap, scan_snap)
+                except _queue.Empty:
+                    pass
+                except Exception as exc:
+                    log.warning("Map worker error: %s", exc)
+
+        import threading as _threading
+        _map_thread = _threading.Thread(
+            target=_map_worker, daemon=True, name="map-worker"
+        )
+        _map_thread.start()
+
         dt = 1.0 / config.CONTROL_HZ
         while self._running:
             t0 = time.time()
             try:
+                # ── 1. Snapshot lidar + update odometry (under lock) ──────────
                 with self.lock:
                     scan = self.lidar.get_scan()
                     self.state.lidar_connected = self.lidar.connected
                     self.state.latest_scan_points = len(scan)
                     self._update_odometry()
-                    if self.state.mapping and scan:
-                        self.map.update_from_scan(self.state.pose, scan)
+                    pose_snap = (self.state.pose.x,
+                                 self.state.pose.y,
+                                 self.state.pose.theta)
+
+                # ── 2. ICP localization (outside lock — can be slow) ──────────
+                if config.LIDAR_LOCALIZATION_ENABLED and scan:
+                    corrected = self.localizer.correct(self.state.pose, scan)
+                    with self.lock:
+                        self.state.pose.x     = corrected.x
+                        self.state.pose.y     = corrected.y
+                        self.state.pose.theta = corrected.theta
+                        pose_snap = (corrected.x, corrected.y, corrected.theta)
+
+                # ── 3. Queue map update (non-blocking) ────────────────────────
+                with self.lock:
+                    do_map = self.state.mapping
+                if do_map and scan:
+                    from app.robot.state import Pose as _Pose
+                    p = _Pose(*pose_snap)
+                    try:
+                        _map_q.put_nowait((p, scan))
+                    except _queue.Full:
+                        pass  # drop frame — map worker still catching up
+
+                # ── 4. Obstacle detection + motion dispatch ───────────────────
+                with self.lock:
                     self.state.obstacle_stop = self._obstacle_in_cone(scan)
-                    if self.state.mode == "mission" and self.state.nav.active:
-                        self._nav_step(scan)
-                    else:
-                        self._manual_step()
+                    mode = self.state.mode
+                    nav_active = self.state.nav.active
+
+                if mode == "mission" and nav_active:
+                    self._nav_step(scan)
+                else:
+                    self._manual_step()
+
             except Exception as exc:
                 log.exception("Control loop error: %s", exc)
+
             elapsed = time.time() - t0
             time.sleep(max(0.0, dt - elapsed))
 
@@ -384,18 +503,101 @@ class RobotRuntime:
             self.state.nav.active = False
             self.state.linear_cmd = 0.0
             self.state.angular_cmd = 0.0
+            self._obstacle_reverse_until = 0.0
             return
+
+        now = time.time()
+
+        # ══ Obstacle handling — 5-second patience → back-up → forced replan ══
+        #
+        #  Phase 1  (0 – OBSTACLE_WAIT_BEFORE_REPLAN_S):
+        #    Stop and wait.  Rover holds position; if the obstacle moves away
+        #    the nav loop resumes automatically via the "cleared" block below.
+        #
+        #  Phase 2  (after patience expires):
+        #    Brief reverse (OBSTACLE_REPLAN_REVERSE_S) to clear the stop zone.
+        #
+        #  Phase 3:
+        #    Force an immediate A* replan.  The live scan is stamped into the
+        #    map so the planner sees the obstacle and routes around it.
+        # ─────────────────────────────────────────────────────────────────────
+        if self.state.obstacle_stop:
+            if self._obstacle_blocked_at == 0.0:
+                self._obstacle_blocked_at = now
+                log.info(
+                    "Obstacle detected — waiting %.0f s before replanning",
+                    config.OBSTACLE_WAIT_BEFORE_REPLAN_S,
+                )
+
+            elapsed = now - self._obstacle_blocked_at
+            wait_s  = config.OBSTACLE_WAIT_BEFORE_REPLAN_S
+
+            if elapsed < wait_s:
+                # ── Phase 1: patience window — hold still, show countdown ────
+                self.queue.push_stop()
+                remaining = wait_s - elapsed
+                self.state.nav.status = f"obstacle: waiting {remaining:.0f} s"
+                self.state.linear_cmd  = 0.0
+                self.state.angular_cmd = 0.0
+                return
+
+            # ── Phase 2: patience expired — reverse briefly ──────────────────
+            if self._obstacle_reverse_until == 0.0:
+                rev_dur = config.OBSTACLE_REPLAN_REVERSE_S
+                self._obstacle_reverse_until = now + rev_dur
+                log.info(
+                    "Obstacle still present after %.0f s — reversing %.1f s then replanning",
+                    wait_s, rev_dur,
+                )
+
+            if now < self._obstacle_reverse_until:
+                rev_speed = config.OBSTACLE_REVERSE_SPEED
+                left_pwm, right_pwm = self._cmd_to_pwm(rev_speed, 0.0)
+                self.queue.push_nav(left_pwm, right_pwm)
+                self.state.nav.status  = "obstacle: reversing to replan"
+                self.state.linear_cmd  = rev_speed
+                self.state.angular_cmd = 0.0
+                return
+
+            # ── Phase 3: reverse done — stamp obstacle in map → forced replan
+            log.info("Forcing replan around persistent obstacle")
+            # Mark obstacle cells even if mapping is off, so A* avoids it
+            if scan:
+                self.map.update_from_scan(self.state.pose, scan)
+            self._obstacle_blocked_at    = 0.0
+            self._obstacle_reverse_until = 0.0
+            self.state.nav.last_plan_time = 0.0   # trigger immediate replan
+            self.state.nav.path          = []
+            self.state.nav.status        = "replanning around obstacle"
+            # Fall through to normal nav so the plan runs this tick
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── Obstacle cleared before patience expired ──────────────────────────
+        if self._obstacle_blocked_at != 0.0:
+            elapsed = now - self._obstacle_blocked_at
+            log.info("Obstacle cleared after %.1f s — resuming path", elapsed)
+            self._obstacle_blocked_at    = 0.0
+            self._obstacle_reverse_until = 0.0
+            # Force one replan so the robot gets a fresh path from its new position
+            self.state.nav.last_plan_time = 0.0
+            self.state.nav.path          = []
+
+        # ── Normal navigation ──────────────────────────────────────────────────
         should_plan = (
             not self.state.nav.path
             or self.state.nav.status == "planning"
-            or (time.time() - self.state.nav.last_plan_time) > config.NAV_REPLAN_SECONDS
+            or (now - self.state.nav.last_plan_time) > config.NAV_REPLAN_SECONDS
         )
         if should_plan:
+            # Sync live scan into the map before planning so new obstacles are visible
+            if scan and self.state.mapping:
+                self.map.update_from_scan(self.state.pose, scan)
             self._plan_path()
             if not self.state.nav.path:
                 self.state.nav.status = "no path"
                 self.queue.push_stop()
                 return
+
         target = self._lookahead_point()
         self.state.nav.current_target = target
         dx = target[0] - self.state.pose.x
@@ -405,10 +607,6 @@ class RobotRuntime:
         angular = max(-1.0, min(1.0, config.NAV_ANGULAR_GAIN * heading_err))
         if abs(heading_err) > config.ROTATE_IN_PLACE_THRESHOLD_RAD:
             linear *= 0.20
-        if self.state.obstacle_stop and linear > 0:
-            self.queue.push_stop()
-            self.state.nav.status = "blocked by obstacle"
-            return
         self.state.linear_cmd  = linear
         self.state.angular_cmd = angular
         self.state.nav.status  = "following path"
@@ -445,16 +643,20 @@ class RobotRuntime:
     def _cmd_to_pwm(self, linear: float, angular: float) -> Tuple[int, int]:
         lmps = linear  * config.MAX_LINEAR_MPS
         rads = angular * config.MAX_ANGULAR_RADPS
-        lw = lmps - 0.5 * config.WHEEL_BASE_M * rads
-        rw = lmps + 0.5 * config.WHEEL_BASE_M * rads
+        # Differential drive: turn left → right wheel faster, left wheel slower
+        # angular > 0 means turn left: left PWM decreases, right PWM increases
+        lw = lmps - 0.5 * config.WHEEL_BASE_M * rads   # left motor
+        rw = lmps + 0.5 * config.WHEEL_BASE_M * rads   # right motor
         max_speed = config.MAX_LINEAR_MPS + 0.5 * config.WHEEL_BASE_M * config.MAX_ANGULAR_RADPS
         if max_speed == 0:
             return 0, 0
         scale = config.MAX_PWM / max_speed
-        return (
-            max(-config.MAX_PWM, min(config.MAX_PWM, int(lw * scale))),
-            max(-config.MAX_PWM, min(config.MAX_PWM, int(rw * scale))),
-        )
+        # NOTE: left/right are NOT swapped here — the Arduino wiring is correct.
+        # Previously these were returning (left, right) but the motor labels on
+        # the Arduino match (left_pwm, right_pwm) directly.
+        left_pwm  = max(-config.MAX_PWM, min(config.MAX_PWM, int(lw * scale)))
+        right_pwm = max(-config.MAX_PWM, min(config.MAX_PWM, int(rw * scale)))
+        return left_pwm, right_pwm
 
     # ── Monitor loop (reconnect + watchdogs) ──────────────────────────────────
 

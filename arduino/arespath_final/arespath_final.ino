@@ -160,14 +160,14 @@ void handleLine(char *line) {
     Serial.println(F("ACK B"));
     return;
   }
-  if (strcmp(cmd, "R") == 0) {
+  if (strcmp(cmd, "L") == 0) {
     setLeft(-DEFAULT_SPEED); setRight(DEFAULT_SPEED);
-    Serial.println(F("ACK R"));
+    Serial.println(F("ACK L"));
     return;
   }
-  if (strcmp(cmd, "L") == 0) {
+  if (strcmp(cmd, "R") == 0) {
     setLeft(DEFAULT_SPEED); setRight(-DEFAULT_SPEED);
-    Serial.println(F("ACK L"));
+    Serial.println(F("ACK R"));
     return;
   }
 

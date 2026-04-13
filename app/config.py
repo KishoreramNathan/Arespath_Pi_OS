@@ -26,7 +26,23 @@ TICKS_PER_WHEEL_REV = 420.0   # encoder counts per full wheel revolution
 MAX_PWM = 180                  # maximum PWM value sent to Arduino
 MAX_LINEAR_MPS = 0.40          # max forward speed in m/s (normalised 1.0 → this)
 MAX_ANGULAR_RADPS = 1.5        # max yaw rate in rad/s
-OBSTACLE_STOP_DISTANCE_M = 0.35  # lidar forward-cone stop threshold
+OBSTACLE_STOP_DISTANCE_M       = 0.35   # lidar forward-cone stop threshold
+OBSTACLE_WAIT_BEFORE_REPLAN_S  = 5.0   # wait this long for obstacle to move before replanning
+OBSTACLE_REPLAN_REVERSE_S      = 0.8   # brief reverse after patience expires before replanning
+OBSTACLE_REVERSE_SPEED         = -0.35 # linear speed fraction for reverse (-1..0)
+
+# ── Rover physical geometry (used for radar rendering) ────────────────────────
+ROVER_LENGTH_M  = 0.520   # front-to-back (metres)
+ROVER_WIDTH_M   = 0.500   # left-to-right (metres)
+ROVER_HEIGHT_M  = 0.300   # floor-to-top  (metres)
+WHEEL_DIAMETER_M = 0.120  # wheel diameter
+WHEEL_TRACK_M    = 0.400  # centre-to-centre distance between left and right wheels
+# LiDAR position in robot frame (x=forward, y=left, origin at rover centre):
+#   From front-right-bottom corner (user coords x=500mm, y=250mm, z=200mm):
+#   rover is 520mm long → 260mm from centre to front → front offset = 260 - (520-500) = 240mm
+#   rover is 500mm wide → 250mm from centre to right → centred: 250 - 250 = 0mm
+LIDAR_OFFSET_X_M = 0.240   # forward of rover centre (+x = forward)
+LIDAR_OFFSET_Y_M = 0.000   # laterally centred
 DEFAULT_SPEED_PCT = 55         # default speed slider value (%)
 
 # ── Control loop ──────────────────────────────────────────────────────────────
@@ -78,17 +94,32 @@ LIDAR_MAX_RANGE_M = 8.0
 LIDAR_RENDER_MAX_POINTS = 360
 
 # ── Occupancy map ─────────────────────────────────────────────────────────────
+# 10,000 sq.ft ≈ 929 m².  At 0.05 m/cell → ~1858 cells/side to be safe.
+# We use 960 × 960 cells → 48 m × 48 m = 2304 m² ≈ 24,800 sq.ft (fits any
+# single-floor 10 k sq.ft building with plenty of margin).
 MAP_RESOLUTION_M = 0.05     # metres per cell
-MAP_SIZE_CELLS = 400        # grid is MAP_SIZE_CELLS × MAP_SIZE_CELLS
-MAP_ORIGIN_X_M = -10.0      # world X coordinate of cell (0,0)
-MAP_ORIGIN_Y_M = -10.0      # world Y coordinate of cell (0,0)
+MAP_SIZE_CELLS = 960        # grid is MAP_SIZE_CELLS × MAP_SIZE_CELLS (48 m × 48 m)
+MAP_ORIGIN_X_M = -24.0      # world X coordinate of cell (0,0)
+MAP_ORIGIN_Y_M = -24.0      # world Y coordinate of cell (0,0)
 FREE_HIT = -1.0             # log-odds decrement for free cells
 OCCUPIED_HIT = 3.0          # log-odds increment for occupied cells
 LOG_ODDS_MIN = -5.0
 LOG_ODDS_MAX = 5.0
 MAP_OCCUPIED_THRESHOLD = 0.65
 MAP_FREE_THRESHOLD = 0.35
-PLANNER_INFLATION_CELLS = 2  # obstacle inflation radius for A*
+PLANNER_INFLATION_CELLS = 3  # obstacle inflation radius for A* (slightly wider for larger map)
+
+# ── LiDAR-based localization (scan-matching ICP) ──────────────────────────────
+LIDAR_LOCALIZATION_ENABLED = True   # set False to fall back to pure odometry
+LIDAR_ICP_MAX_ITERATIONS   = 20     # ICP convergence iterations
+LIDAR_ICP_TOLERANCE_M      = 0.005  # ICP convergence threshold (metres)
+LIDAR_ICP_MAX_CORRESP_M    = 0.30   # max point correspondence distance
+LIDAR_ICP_WEIGHT           = 0.55   # blend weight: 1.0 = full ICP, 0.0 = full odom
+LIDAR_ICP_MIN_POINTS       = 30     # skip ICP if scan has fewer than this many points
+LIDAR_ICP_INTERVAL_S       = 0.15   # run ICP at most this often (seconds)
+
+# ── POI / Waypoint features ───────────────────────────────────────────────────
+POIS_FILE = DATA_DIR / "pois.json"   # persistent store for points of interest
 
 # ── Web server ────────────────────────────────────────────────────────────────
 WEB_PORT = 8080

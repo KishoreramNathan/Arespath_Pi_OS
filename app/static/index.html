@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Arespath Rover — Ops Console</title>
+  <title>Arespath Rover — Ops Console v4</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
 <div class="shell">
 
-  <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
+  <!-- ── Sidebar ───────────────────────────────────────────────────────── -->
   <aside class="sidebar">
 
     <div class="brand">
@@ -17,18 +17,17 @@
       <div>
         <div class="eyebrow">ARESPATH</div>
         <h1>Ops Console</h1>
-        <p class="sub">Raspberry Pi Rover Dashboard</p>
+        <p class="sub">Raspberry Pi Rover · v4</p>
       </div>
     </div>
 
-    <!-- Connection bar -->
     <div id="conn-bar">
       <span id="ws-pill" class="pill dim">WS</span>
       <span>Drive <strong id="st-connected">--</strong></span>
       <span>Lidar <strong id="st-lidar">--</strong></span>
+      <span id="icp-pill" class="pill dim" title="LiDAR ICP localisation">ICP</span>
     </div>
 
-    <!-- System panel -->
     <div class="panel compact">
       <div class="panel-title">System</div>
       <div class="status-grid">
@@ -45,7 +44,6 @@
       </div>
     </div>
 
-    <!-- Mode selector -->
     <div class="panel compact">
       <div class="panel-title">Modes</div>
       <div class="segmented">
@@ -55,7 +53,6 @@
       <p class="hint">Pilot = manual drive. Mission = autonomous navigation.</p>
     </div>
 
-    <!-- Drive controls -->
     <div class="panel compact">
       <div class="panel-title">Drive</div>
       <div class="slider-label">
@@ -69,20 +66,27 @@
         <button data-cmd="right"   title="D / ▶">▶</button>
         <button data-cmd="back"    title="S / ▼">▼</button>
       </div>
-      <p class="hint">Hold button or key (W A S D / Space) to drive. Release to stop.</p>
+      <p class="hint">Hold button or key (W A S D / Space). Release to stop.</p>
     </div>
 
-    <!-- Map & mission -->
     <div class="panel compact">
       <div class="panel-title">Map + Mission</div>
-      <div class="segmented">
-        <button id="toolGoalBtn"  class="secondary active">Goal Tool</button>
-        <button id="toolStartBtn" class="secondary">Start Pose</button>
+      <div class="segmented four">
+        <button id="toolGoalBtn"  class="secondary active">Goal</button>
+        <button id="toolStartBtn" class="secondary">Pose</button>
+        <button id="toolPoiBtn"   class="secondary">+POI</button>
+        <button id="toolPanBtn"   class="secondary">Pan</button>
       </div>
       <div class="actions row top-gap">
         <button id="mapStartBtn" class="secondary">Start Map</button>
         <button id="mapStopBtn"  class="secondary">Stop Map</button>
         <button id="mapResetBtn" class="secondary">Clear</button>
+      </div>
+      <div class="row gap top-gap">
+        <button id="mapZoomInBtn"    class="secondary icon-btn" title="Zoom in">＋</button>
+        <button id="mapZoomOutBtn"   class="secondary icon-btn" title="Zoom out">－</button>
+        <button id="mapZoomResetBtn" class="secondary icon-btn" title="Reset view">⌖</button>
+        <span class="zoom-label">Zoom <strong id="zoomLevel">1×</strong></span>
       </div>
       <div class="row gap top-gap">
         <input id="mapName" placeholder="map name" value="floor_a">
@@ -97,7 +101,6 @@
       </div>
     </div>
 
-    <!-- Telemetry -->
     <div class="panel compact">
       <div class="panel-title">Telemetry</div>
       <div class="metrics two">
@@ -114,31 +117,36 @@
       </div>
     </div>
 
+    <div class="panel compact">
+      <div class="panel-title">Points of Interest</div>
+      <div id="poi-sidebar-list" class="poi-sidebar-list">
+        <p class="hint">No POIs yet. Select "+POI" tool and click the map.</p>
+      </div>
+    </div>
+
   </aside>
 
-  <!-- ── Main viewport ────────────────────────────────────────────────────── -->
+  <!-- ── Main viewport ──────────────────────────────────────────────────── -->
   <main class="main">
 
-    <!-- Hero strip -->
     <section class="hero glass">
       <div>
         <div class="eyebrow">LIVE ROBOTICS VIEW</div>
-        <h2>Occupancy map, lidar scene, dual cameras, and autonomous navigation.</h2>
-        <p class="sub">Arespath Rover — Raspberry Pi + Arduino Uno + BTS7960 motor driver.</p>
+        <h2>10 000 sq.ft occupancy map · LiDAR ICP localisation · POI waypoints · Autonomous navigation.</h2>
+        <p class="sub">Arespath Rover v4 — Raspberry Pi + Arduino Uno + BTS7960 · Scan-matching corrects slippery-surface odometry drift.</p>
       </div>
       <div class="hero-badges">
-        <span>20 Hz control</span>
-        <span>Lidar scene</span>
+        <span>48 m × 48 m map</span>
+        <span>ICP localisation</span>
+        <span>POI / gazebo</span>
+        <span>Pan &amp; zoom</span>
         <span>A* planner</span>
-        <span>MJPEG video</span>
         <span>Socket.IO</span>
       </div>
     </section>
 
-    <!-- Viewport panels -->
     <section class="viewport-grid">
 
-      <!-- Scene view -->
       <div class="panel glass scene-panel">
         <div class="panel-head">
           <div>
@@ -150,10 +158,9 @@
             <span><i class="lg obstacle"></i> stop zone</span>
           </div>
         </div>
-        <canvas id="sceneCanvas" width="900" height="300"></canvas>
+        <canvas id="sceneCanvas" width="900" height="260"></canvas>
       </div>
 
-      <!-- Radar -->
       <div class="panel glass radar-panel">
         <div class="panel-head">
           <div>
@@ -165,36 +172,39 @@
         <canvas id="radarCanvas" width="380" height="380"></canvas>
       </div>
 
-      <!-- Mission map -->
       <div class="panel glass map-panel">
         <div class="panel-head">
           <div>
-            <div class="panel-title">Mission Map</div>
-            <div class="sub">Occupancy grid, robot pose, path, and navigation goal.</div>
+            <div class="panel-title">Mission Map
+              <span class="map-size-badge">48 m × 48 m · ~10 000 sq.ft</span>
+            </div>
+            <div class="sub">Scroll to zoom · drag to pan · click to interact</div>
           </div>
           <div class="legend pill-row">
             <span><i class="lg free"></i> free</span>
             <span><i class="lg occ"></i> occ</span>
             <span><i class="lg scan"></i> lidar</span>
             <span><i class="lg path"></i> path</span>
+            <span><i class="lg poi-leg"></i> POI</span>
           </div>
         </div>
-        <canvas id="mapCanvas" width="820" height="820"></canvas>
-        <div class="map-help">Click to place goal. In Start Pose mode: click + drag to set heading.</div>
+        <div class="map-outer" id="mapOuter">
+          <canvas id="mapCanvas" width="820" height="820"></canvas>
+        </div>
+        <div class="map-help">
+          Tool: <strong id="tool-hint-inline">GOAL</strong> &nbsp;|&nbsp;
+          Scroll=zoom &nbsp;·&nbsp; Pan tool = drag &nbsp;·&nbsp;
+          Goal/POI = click &nbsp;·&nbsp; Start Pose = click+drag
+        </div>
       </div>
 
-      <!-- ── Vision panel ──────────────────────────────────────────────────── -->
       <div class="panel glass cameras-panel">
-
-        <!-- Header -->
         <div class="panel-head">
           <div>
             <div class="panel-title">Vision</div>
             <div class="sub">Live MJPEG · Snapshots · Photos</div>
           </div>
         </div>
-
-        <!-- Live streams -->
         <div class="camera-grid">
           <div class="cam-card">
             <div class="cam-label">Front</div>
@@ -205,18 +215,14 @@
             <img id="rearCam" src="/video/rear" alt="rear">
           </div>
         </div>
-
-        <!-- ── Snapshot ring-buffer section ─────────────────────────────── -->
         <div class="vision-section">
-          <div class="vision-section-title">Auto Snapshots <span class="hint-inline">(ring-buffer, max 10 per camera, every 10 s)</span></div>
+          <div class="vision-section-title">Auto Snapshots <span class="hint-inline">(ring-buffer, max 10/cam, every 10 s)</span></div>
           <div class="vision-actions">
             <button id="snapToggleBtn" class="secondary">📷 Start Snapshots</button>
             <span class="snap-count-badge">F:<strong id="snapCountFront">0</strong> R:<strong id="snapCountRear">0</strong></span>
             <button id="viewSnapshotsBtn" class="secondary">🖼 View Snapshots</button>
           </div>
         </div>
-
-        <!-- ── Permanent photo section ───────────────────────────────────── -->
         <div class="vision-section">
           <div class="vision-section-title">Permanent Photos <span class="hint-inline">(saved forever, both cameras)</span></div>
           <div class="vision-actions">
@@ -225,14 +231,67 @@
             <button id="viewPhotosBtn" class="secondary">🗂 View Photos</button>
           </div>
         </div>
-
-      </div><!-- /cameras-panel -->
+      </div>
 
     </section>
   </main>
 </div>
 
-<!-- ── Snapshot Gallery Modal ──────────────────────────────────────────────── -->
+<!-- ── POI Add Modal ───────────────────────────────────────────────────── -->
+<div id="poiModal" class="modal-overlay" style="display:none;">
+  <div class="modal-box modal-sm">
+    <div class="modal-header">
+      <div class="modal-title">Add Point of Interest</div>
+      <button class="modal-close" id="poiModalClose">✕</button>
+    </div>
+    <div class="poi-form">
+      <label>Label<input id="poiLabel" type="text" placeholder="Gazebo" maxlength="64"></label>
+      <label>Type
+        <select id="poiKind">
+          <option value="gazebo">⛺ Gazebo</option>
+          <option value="waypoint" selected>📍 Waypoint</option>
+          <option value="dock">🔌 Charging Dock</option>
+          <option value="custom">⭐ Custom</option>
+        </select>
+      </label>
+      <label>Note (optional)<input id="poiNote" type="text" placeholder="Description…" maxlength="256"></label>
+      <div class="poi-coords-preview">Location: <strong id="poiCoordPreview">—</strong></div>
+      <div class="actions row top-gap">
+        <button id="poiSaveBtn" class="primary full">Save POI</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── POI Edit Modal ────────────────────────────────────────────────────── -->
+<div id="poiEditModal" class="modal-overlay" style="display:none;">
+  <div class="modal-box modal-sm">
+    <div class="modal-header">
+      <div class="modal-title">Edit POI</div>
+      <button class="modal-close" id="poiEditClose">✕</button>
+    </div>
+    <div class="poi-form">
+      <input type="hidden" id="poiEditId">
+      <label>Label<input id="poiEditLabel" type="text" maxlength="64"></label>
+      <label>Type
+        <select id="poiEditKind">
+          <option value="gazebo">⛺ Gazebo</option>
+          <option value="waypoint">📍 Waypoint</option>
+          <option value="dock">🔌 Charging Dock</option>
+          <option value="custom">⭐ Custom</option>
+        </select>
+      </label>
+      <label>Note<input id="poiEditNote" type="text" maxlength="256"></label>
+      <div class="actions row top-gap">
+        <button id="poiEditNavBtn"  class="primary">Navigate Here</button>
+        <button id="poiEditSaveBtn" class="secondary">Update</button>
+        <button id="poiEditDelBtn"  class="danger">Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Gallery Modal ─────────────────────────────────────────────────────── -->
 <div id="modalOverlay" class="modal-overlay" style="display:none;">
   <div class="modal-box">
     <div class="modal-header">
