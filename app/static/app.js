@@ -876,9 +876,10 @@ async function drawMap(meta) {
 
   if (meta.scan?.length) {
     mapCtx.fillStyle = 'rgba(52,211,153,0.7)';
-    const dot = 1.5 / z;
+    const dot = 1.5;
     meta.scan.forEach(p => {
-      mapCtx.fillRect(p.x - dot/2, p.y - dot/2, dot, dot);
+      const c = toC(p);
+      mapCtx.fillRect(c.x - dot/2, c.y - dot/2, dot, dot);
     });
   }
 
@@ -985,139 +986,6 @@ async function drawMap(meta) {
   mapCtx.fillText(`${(meta.resolution * 100)|0} cm/px`, cw - 6, ch - 6);
   mapCtx.restore();
 }
-  } else {
-    mapCtx.fillStyle = '#0f1729';
-    mapCtx.fillRect(panX, panY, vw, vh);
-  }
-
-  const toC = p => ({
-    x: p.x * scale + panX,
-    y: p.y * scale + panY
-  });
-
-  const step = Math.max(5, Math.round(1.0 / meta.resolution));
-  mapCtx.save();
-  mapCtx.strokeStyle = 'rgba(255,255,255,0.05)'; mapCtx.lineWidth = 1 / scale;
-  for (let x = 0; x <= meta.width; x += step) {
-    const px = x + panX;
-    mapCtx.beginPath(); mapCtx.moveTo(px, panY); mapCtx.lineTo(px, panY + vh); mapCtx.stroke();
-  }
-  for (let y = 0; y <= meta.height; y += step) {
-    const py = y + panY;
-    mapCtx.beginPath(); mapCtx.moveTo(panX, py); mapCtx.lineTo(panX + vw, py); mapCtx.stroke();
-  }
-  mapCtx.restore();
-
-  if (meta.scan?.length) {
-    mapCtx.fillStyle = 'rgba(52,211,153,0.7)';
-    const dot = 1.5 / scale;
-    meta.scan.forEach(p => {
-      const c = toC(p);
-      mapCtx.fillRect(c.x - dot/2, c.y - dot/2, dot, dot);
-    });
-  }
-
-  if (meta.path?.length > 1) {
-    mapCtx.save();
-    mapCtx.strokeStyle = '#38bdf8'; mapCtx.lineWidth = 2 / scale;
-    mapCtx.shadowColor = 'rgba(56,189,248,0.5)'; mapCtx.shadowBlur = 6 / scale;
-    mapCtx.beginPath();
-    meta.path.forEach((p, i) => { const c = toC(p); if (i === 0) mapCtx.moveTo(c.x, c.y); else mapCtx.lineTo(c.x, c.y); });
-    mapCtx.stroke(); mapCtx.restore();
-  }
-
-  if (STATE.pendingGoal && STATE.mapMeta) {
-    const c = toC(STATE.pendingGoal);
-    mapCtx.save();
-    mapCtx.strokeStyle = '#60a5fa'; mapCtx.lineWidth = 1.5 / scale;
-    mapCtx.setLineDash([3 / scale, 2 / scale]);
-    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 3 / scale, 0, Math.PI * 2); mapCtx.stroke();
-    mapCtx.setLineDash([]);
-    mapCtx.beginPath();
-    mapCtx.moveTo(c.x, c.y - 8 / scale); mapCtx.lineTo(c.x, c.y + 8 / scale);
-    mapCtx.moveTo(c.x - 8 / scale, c.y); mapCtx.lineTo(c.x + 8 / scale, c.y);
-    mapCtx.stroke(); mapCtx.restore();
-  }
-
-  if (meta.goal) {
-    const c = toC(meta.goal);
-    mapCtx.save();
-    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 2 / scale;
-    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 6 / scale;
-    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 3.5 / scale, 0, Math.PI * 2); mapCtx.stroke();
-    mapCtx.beginPath();
-    mapCtx.moveTo(c.x, c.y - 10 / scale); mapCtx.lineTo(c.x, c.y + 10 / scale);
-    mapCtx.moveTo(c.x - 10 / scale, c.y); mapCtx.lineTo(c.x + 10 / scale, c.y);
-    mapCtx.stroke(); mapCtx.restore();
-  }
-
-  // POIs
-  const pois = meta.pois || [];
-  pois.forEach(poi => {
-    const c = toC({ x: poi.px, y: poi.py });
-    const r = 8 / scale;
-    mapCtx.save();
-    mapCtx.fillStyle = 'rgba(251,191,36,0.2)';
-    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, r * 1.6, 0, Math.PI*2); mapCtx.fill();
-    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 1.5 / scale;
-    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 4 / scale;
-    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, r, 0, Math.PI*2); mapCtx.stroke();
-    mapCtx.restore();
-    mapCtx.save();
-    mapCtx.font = `${11 / scale}px sans-serif`;
-    mapCtx.textAlign = 'center'; mapCtx.textBaseline = 'top';
-    mapCtx.fillStyle = '#fbbf24';
-    mapCtx.shadowColor = '#000'; mapCtx.shadowBlur = 2 / scale;
-    mapCtx.fillText(poi.label, c.x, c.y + r + 1 / scale);
-    mapCtx.restore();
-  });
-
-  // Robot — scaled rectangle (520×500 mm)
-  if (meta.pose) {
-    const c   = toC(meta.pose);
-    const th  = meta.pose.theta;
-    const ppm = 1 / meta.resolution;  // map pixels per metre
-    const rL  = 0.520 / 2 * ppm;   // half-length in map pixels
-    const rW  = 0.500 / 2 * ppm;   // half-width  in map pixels
-    mapCtx.save();
-    mapCtx.translate(c.x, c.y);
-    mapCtx.rotate(th);
-    mapCtx.fillStyle = 'rgba(56,189,248,0.15)';
-    mapCtx.fillRect(-rW, -rL, rW * 2, rL * 2);
-    mapCtx.strokeStyle = 'rgba(56,189,248,0.6)'; mapCtx.lineWidth = 1.5 / scale;
-    mapCtx.strokeRect(-rW, -rL, rW * 2, rL * 2);
-    mapCtx.strokeStyle = '#34d399'; mapCtx.lineWidth = 2.5 / scale;
-    mapCtx.shadowColor = 'rgba(52,211,153,0.6)'; mapCtx.shadowBlur = 6 / scale;
-    mapCtx.beginPath(); mapCtx.moveTo(-rW, rL); mapCtx.lineTo(rW, rL); mapCtx.stroke();
-    mapCtx.shadowBlur = 0;
-    mapCtx.fillStyle = '#38bdf8';
-    mapCtx.shadowColor = 'rgba(56,189,248,0.6)'; mapCtx.shadowBlur = 8 / scale;
-    const ar = Math.max(3 / scale, rL * 0.5);
-    mapCtx.beginPath();
-    mapCtx.moveTo(0, rL - ar * 0.2); mapCtx.lineTo(-ar * 0.5, rL - ar); mapCtx.lineTo(ar * 0.5, rL - ar);
-    mapCtx.closePath(); mapCtx.fill();
-    mapCtx.restore();
-  }
-
-  mapCtx.restore(); // end world-space rendering
-
-  // HUD: scale bar (screen space, bottom-left)
-  const pixelsPerM_screen = vw / (meta.width * meta.resolution) * scale;
-  const bar1m_s = pixelsPerM_screen;
-  mapCtx.save();
-  mapCtx.fillStyle = 'rgba(255,255,255,0.85)';
-  mapCtx.fillRect(12, ch - 22, bar1m_s, 3);
-  mapCtx.font = '8px monospace'; mapCtx.textAlign = 'left'; mapCtx.fillStyle = 'rgba(255,255,255,0.75)';
-  mapCtx.fillText('1 m', 12 + bar1m_s + 3, ch - 18);
-  const bar5m_s = 5 * pixelsPerM_screen;
-  mapCtx.fillStyle = 'rgba(56,189,248,0.55)';
-  mapCtx.fillRect(12, ch - 12, bar5m_s, 3);
-  mapCtx.fillStyle = 'rgba(56,189,248,0.7)';
-  mapCtx.fillText('5 m', 12 + bar5m_s + 3, ch - 10);
-  mapCtx.textAlign = 'right'; mapCtx.fillStyle = 'rgba(99,130,180,0.5)';
-  mapCtx.fillText(`${(meta.resolution * 100)|0} cm/px`, cw - 6, ch - 6);
-  mapCtx.restore();
-}
 
 // ── Lidar render ──────────────────────────────────────────────────────────────
 async function refreshLidar() {
@@ -1197,12 +1065,28 @@ function drawRadar(data) {
     radarCtx.restore();
   }
 
+  // ── LiDAR connection status overlay ────────────────────────────────────────
+  if (!data.connected) {
+    radarCtx.save();
+    radarCtx.fillStyle = 'rgba(248,113,113,0.85)';
+    radarCtx.font = 'bold 12px sans-serif'; radarCtx.textAlign = 'center';
+    radarCtx.fillText('LiDAR OFFLINE', cx, cy + 6);
+    radarCtx.fillStyle = 'rgba(100,116,139,0.7)';
+    radarCtx.font = '9px monospace';
+    radarCtx.fillText(data.error || 'No data', cx, cy + 22);
+    radarCtx.restore();
+  }
+
   // ── Scan points ────────────────────────────────────────────────────────────
   if (data.points?.length) {
-    radarCtx.fillStyle = data.obstacle_stop ? '#f87171' : '#34d399';
+    const dotColor = data.obstacle_stop ? '#f87171' : '#34d399';
+    radarCtx.fillStyle = dotColor;
+    const dotSize = Math.max(2, Math.min(4, 360 / data.points.length));
+    const half = dotSize / 2;
     data.points.forEach(p => {
       const sx = cx - p.y * scale, sy = cy - p.x * scale;
-      radarCtx.fillRect(sx - 1.5, sy - 1.5, 3, 3);
+      if (sx < 0 || sx > cw || sy < 0 || sy > ch) return;
+      radarCtx.fillRect(sx - half, sy - half, dotSize, dotSize);
     });
   }
 

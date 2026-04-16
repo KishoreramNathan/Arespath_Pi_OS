@@ -105,7 +105,7 @@ LIDAR_SAMPLE_RATE = 3
 LIDAR_SINGLE_CHANNEL = True
 LIDAR_MIN_RANGE_M = 0.12
 LIDAR_MAX_RANGE_M = 8.0
-LIDAR_RENDER_MAX_POINTS = 360
+LIDAR_RENDER_MAX_POINTS = 720   # Full scan density for radar visualization
 
 # ── Occupancy map ─────────────────────────────────────────────────────────────
 # 10,000 sq.ft ≈ 929 m².  At 0.02 m/cell (2cm) → high detail mapping.

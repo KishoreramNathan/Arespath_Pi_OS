@@ -358,7 +358,7 @@ class RobotRuntime:
         out = []
         if not scan:
             return out
-        step = max(1, len(scan) // 360)   # up to 360 points for density
+        step = max(1, len(scan) // 720)   # up to 720 points for density
         pose = self.state.pose
         for angle, dist in scan[::step]:
             if dist <= 0:
