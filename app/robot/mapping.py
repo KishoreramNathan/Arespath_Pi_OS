@@ -41,6 +41,7 @@ class OccupancyGridMap:
         self.origin_x = config.MAP_ORIGIN_X_M
         self.origin_y = config.MAP_ORIGIN_Y_M
         self.log_odds = np.zeros((self.size, self.size), dtype=np.float32)
+        self._scan_count = 0  # Track scans for stability
 
     # ── Coordinate helpers ────────────────────────────────────────────────────
 
@@ -62,12 +63,21 @@ class OccupancyGridMap:
 
     def clear(self) -> None:
         self.log_odds.fill(0.0)
+        self._scan_count = 0
 
     def update_from_scan(self, pose: Pose, scan: List[Tuple[float, float]]) -> None:
         rx, ry = self.world_to_grid(pose.x, pose.y)
         if not self.in_bounds(rx, ry):
             return
-        for angle, dist in scan:
+        
+        self._scan_count += 1
+        
+        # Reject zero/NaN readings early
+        valid = [(a, d) for a, d in scan if math.isfinite(d) and d > 0.02]
+        if not valid:
+            return
+        
+        for angle, dist in valid:
             global_angle = pose.theta + angle
             wx = pose.x + dist * math.cos(global_angle)
             wy = pose.y + dist * math.sin(global_angle)

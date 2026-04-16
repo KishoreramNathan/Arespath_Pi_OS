@@ -1,79 +1,41 @@
 /**
- * Arespath Rover — Dashboard app.js  v6
+ * Arespath Rover — Dashboard app.js  v4
  *
- * v6 Improvements
- * ───────────────
- * • FIXED COORDINATE TRANSFORMS (critical bug fixes)
- *   - pxToC(): Direct pixel-to-canvas mapping (pixel coords from backend → canvas px)
- *   - worldToCanvas(): Proper world→grid→canvas with full resolution preservation
- *   - canvasToWorld(): Correctly handles CSS zoom/pan transform for click detection
- *   - All markers (goal, start, POI) now align perfectly with map cells
- *
- * • HIGH-QUALITY MAP RENDERING
- *   - HiDPI / Retina canvas (devicePixelRatio scaling) for crisp rendering
- *   - Bilinear-filtered map image rendering (imageSmoothingQuality: 'high')
- *   - Multi-layer canvas compositing: base map → costmap → scan → overlays
- *   - Costmap inflation ring around obstacles (like ROS costmap2d)
- *   - Occupancy probability color gradient (white→grey→dark, not binary)
- *   - Scan sweep arc visualization (shows current LiDAR sweep angle)
- *   - Robot heading indicator with accurate bearing arrow
- *   - Grid with world-coordinate labels (every 1m at high zoom, 5m at low zoom)
- *
- * • ACCURATE FIXED POINTS
- *   - canvasToWorld() correctly inverts the zoom+pan CSS transform
- *   - worldToCanvas() helper for painting markers exactly at world coords
- *   - Start pose drag uses corrected coordinate math
- *   - POI pixel coords now round-trip cleanly
- *
- * • GAZEBO / ROS-LEVEL MAP FEATURES
- *   - Costmap inflation overlay (pink halos around walls)
- *   - Scan sweep fan overlay (translucent green sector, last scan angle)
- *   - Map coordinate HUD: cursor world position shown in real time
- *   - Scale bar accurate to zoom level
- *   - "Unknown" cells shown in distinct mid-grey (ROS rviz convention)
- *   - Path rendered with distance-to-goal label
- *   - Minimap thumbnail in corner when zoomed in
- *
- * • RESPONSIVE UI
- *   - Map polling increased from 950ms to 300ms for real-time updates
- *   - HiDPI canvas setup with proper DPR scaling
- *   - Debounced ResizeObserver for efficient canvas resizing
- *   - Smooth zoom animation via CSS transition on mapCanvas
- *   - All poll loops sequential (no overlapping fetches)
- *   - Socket.IO heartbeat + reconnection
+ * New in v4
+ * ─────────
+ * • 10 000 sq.ft map (48 m × 48 m grid, 960 × 960 cells)
+ * • POI / Gazebo waypoints — add, move, label, navigate-to, delete
+ * • Map pan & zoom — scroll wheel + drag-to-pan (Pan tool) + zoom buttons
+ * • LiDAR ICP localisation status pill
+ * • Mapping + pilot control glitch fix — map worker thread decoupled in backend;
+ *   frontend uses independent debounced loops that never block each other
+ * • All poll loops use a sequential debounce pattern (next tick starts only
+ *   after previous await resolves) → no overlapping fetches
  */
 
 'use strict';
-
-// ── Pixel ratio for HiDPI displays ─────────────────────────────────────────────
-const DPR = window.devicePixelRatio || 1;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const STATE = {
   armed:       false,
   mode:        'pilot',
   wsAlive:     false,
-  mapTool:     'goal',
+  mapTool:     'goal',   // 'goal' | 'start' | 'poi' | 'pan'
   mapMeta:     null,
   dragStart:   null,
   headingPrev: 0,
   activeCmd:   null,
   snapping:    false,
+  // Map viewport (pan + zoom)
   mapZoom:     1.0,
-  mapPanX:     0,
+  mapPanX:     0,      // canvas-pixel offset
   mapPanY:     0,
   mapDragging: false,
   mapDragLast: null,
-  pendingPoi:  null,
-  showCostmap: true,
-  showSweep:   true,
-  showGrid:    true,
-  showMinimap: true,
-  _pois:       [],
-  _lastScanPts: [],
-  _cursorWorld: null,
-  _mapImg:     null,
-  _mapImgSrc:  null,
+  // POI pending placement
+  pendingPoi:  null,   // {x, y} world coords awaiting form submit
+  // Goal pending placement (placed on map, not yet sent to backend)
+  pendingGoal: null,   // {x, y} world coords
 };
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
@@ -95,6 +57,7 @@ const EL = {
   saveMapBtn:      el('saveMapBtn'),
   loadMapBtn:      el('loadMapBtn'),
   cancelNavBtn:    el('cancelNavBtn'),
+  startMissionBtn: el('startMissionBtn'),
   mapZoomInBtn:    el('mapZoomInBtn'),
   mapZoomOutBtn:   el('mapZoomOutBtn'),
   mapZoomResetBtn: el('mapZoomResetBtn'),
@@ -144,75 +107,57 @@ const EL = {
 
 const mapCtx   = EL.mapCanvas.getContext('2d');
 const radarCtx = EL.radarCanvas.getContext('2d');
-const sceneCtx = EL.sceneCanvas && EL.sceneCanvas.getContext('2d');
+const sceneCtx = EL.sceneCanvas.getContext('2d');
 
-// ── HiDPI canvas setup ────────────────────────────────────────────────────────
-function setupHiDPI(canvas, cssW, cssH) {
-  const bw = Math.round(cssW * DPR);
-  const bh = Math.round(cssH * DPR);
-  if (canvas.width !== bw || canvas.height !== bh) {
-    canvas.width  = bw;
-    canvas.height = bh;
-    canvas.style.width  = cssW + 'px';
-    canvas.style.height = cssH + 'px';
-  }
-  return { bw, bh };
+// ── HiDPI canvas setup ───────────────────────────────────────────────────────
+// Use devicePixelRatio so the canvas renders at native resolution on Retina/HiDPI screens
+const DPR = window.devicePixelRatio || 1;
+function setupHiDPICanvas(canvas, cssW, cssH) {
+  canvas.width  = cssW * DPR;
+  canvas.height = cssH * DPR;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(DPR, DPR);
+  canvas.style.width  = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  return ctx;
 }
 
-// ── Cursor HUD injection ──────────────────────────────────────────────────────
-function _ensureCursorHUD() {
-  if (document.getElementById('map-cursor-hud')) return;
-  const hud = document.createElement('div');
-  hud.id = 'map-cursor-hud';
-  hud.style.cssText = `
-    position:absolute; bottom:36px; left:8px; z-index:20;
-    background:rgba(13,20,34,0.82); color:#94a3b8;
-    font:10px/1.4 monospace; padding:3px 7px; border-radius:4px;
-    pointer-events:none; display:none;
-  `;
-  EL.mapOuter.style.position = 'relative';
-  EL.mapOuter.appendChild(hud);
+// Map canvas: 820px CSS wide, full HiDPI support
+const MAP_CSS_W = 820;
+const MAP_CSS_H = 820;
+setupHiDPICanvas(EL.mapCanvas, MAP_CSS_W, MAP_CSS_H);
+
+// Map viewport state — world coordinates of the visible viewport centre
+const VIEW = {
+  zoom:    1.0,      // pixels per world-metre
+  centerX: 0.0,      // world X of canvas centre
+  centerY: 0.0,      // world Y of canvas centre
+};
+
+// ── Coordinate conversion ─────────────────────────────────────────────────────
+// World (metres) ↔ Canvas pixels (CSS pixels, accounting for DPR)
+function worldToCanvas(wx, wy) {
+  return {
+    x: (wx - VIEW.centerX) * VIEW.zoom + MAP_CSS_W / 2,
+    y: (wy - VIEW.centerY) * VIEW.zoom + MAP_CSS_H / 2,
+  };
 }
 
-// ── Overlay toggle bar injection ──────────────────────────────────────────────
-function _ensureOverlayToggles() {
-  if (document.getElementById('map-overlay-bar')) return;
-  const bar = document.createElement('div');
-  bar.id = 'map-overlay-bar';
-  bar.style.cssText = `
-    position:absolute; top:6px; right:8px; z-index:20;
-    display:flex; gap:5px; flex-wrap:wrap;
-  `;
-  const toggles = [
-    { id: 'tog-costmap', label: 'Costmap', stateKey: 'showCostmap' },
-    { id: 'tog-sweep',  label: 'Sweep',   stateKey: 'showSweep' },
-    { id: 'tog-grid',   label: 'Grid',    stateKey: 'showGrid' },
-    { id: 'tog-mini',   label: 'Mini',    stateKey: 'showMinimap' },
-  ];
-  toggles.forEach(t => {
-    const btn = document.createElement('button');
-    btn.id = t.id;
-    btn.textContent = t.label;
-    btn.style.cssText = `
-      background:rgba(56,189,248,0.35); color:#e2e8f0;
-      border:1px solid rgba(56,189,248,0.30); border-radius:4px;
-      font:9px monospace; padding:2px 6px; cursor:pointer;
-    `;
-    btn.addEventListener('click', () => {
-      STATE[t.stateKey] = !STATE[t.stateKey];
-      btn.style.background = STATE[t.stateKey] ? 'rgba(56,189,248,0.35)' : 'rgba(56,189,248,0.10)';
-      btn.style.color = STATE[t.stateKey] ? '#e2e8f0' : '#64748b';
-    });
-    bar.appendChild(btn);
-  });
-  EL.mapOuter.appendChild(bar);
+function canvasToWorld(cx, cy) {
+  return {
+    x: (cx - MAP_CSS_W / 2) / VIEW.zoom + VIEW.centerX,
+    y: (cy - MAP_CSS_H / 2) / VIEW.zoom + VIEW.centerY,
+  };
 }
 
-// Init overlay elements
-window.addEventListener('DOMContentLoaded', () => {
-  _ensureCursorHUD();
-  _ensureOverlayToggles();
-});
+// Convert pointer event to canvas-relative CSS pixels
+function eventToCanvasPx(e) {
+  const rect = EL.mapCanvas.getBoundingClientRect();
+  return {
+    x: e.clientX - rect.left,
+    y: e.clientY - rect.top,
+  };
+}
 
 // ── REST helper ───────────────────────────────────────────────────────────────
 async function api(path, method = 'GET', body = null) {
@@ -399,52 +344,37 @@ EL.loadMapBtn  .addEventListener('click', () => {
   const name = EL.mapSelect.value;
   if (name) api('/api/map/load', 'POST', { name }).catch(() => {});
 });
-EL.cancelNavBtn.addEventListener('click', () => api('/api/navigate/cancel', 'POST', {}).catch(() => {}));
+EL.startMissionBtn.addEventListener('click', () => {
+  if (!STATE.pendingGoal) { alert('Place a goal on the map first.'); return; }
+  api('/api/navigate/goal', 'POST', { x: STATE.pendingGoal.x, y: STATE.pendingGoal.y }).catch(() => {});
+});
+EL.cancelNavBtn.addEventListener('click', () => { api('/api/navigate/cancel', 'POST', {}).catch(() => {}); STATE.pendingGoal = null; });
 
 // ── Map zoom / pan buttons ────────────────────────────────────────────────────
 EL.mapZoomInBtn   .addEventListener('click', () => applyZoom(1.25));
 EL.mapZoomOutBtn  .addEventListener('click', () => applyZoom(0.80));
-EL.mapZoomResetBtn.addEventListener('click', () => {
-  STATE.mapZoom = 1; STATE.mapPanX = 0; STATE.mapPanY = 0;
-  _updateMapTransform();
-});
+EL.mapZoomResetBtn.addEventListener('click', () => { STATE.mapZoom = 1; STATE.mapPanX = 0; STATE.mapPanY = 0; _updateMapTransform(); });
 
-function applyZoom(factor, pivotX, pivotY) {
-  const cw = EL.mapCanvas.offsetWidth;
-  const ch = EL.mapCanvas.offsetHeight;
-  const oldZoom = STATE.mapZoom;
-  const newZoom = Math.max(0.25, Math.min(12, oldZoom * factor));
-
-  if (pivotX !== undefined) {
-    const outer = EL.mapOuter.getBoundingClientRect();
-    const outerCx = outer.width / 2;
-    const outerCy = outer.height / 2;
-    const dx = pivotX - (outer.left + outerCx + STATE.mapPanX);
-    const dy = pivotY - (outer.top + outerCy + STATE.mapPanY);
-    STATE.mapPanX -= dx * (newZoom / oldZoom - 1);
-    STATE.mapPanY -= dy * (newZoom / oldZoom - 1);
-  }
-
-  STATE.mapZoom = newZoom;
+function applyZoom(factor) {
+  const cw = EL.mapCanvas.width, ch = EL.mapCanvas.height;
+  STATE.mapZoom = Math.max(0.25, Math.min(8, STATE.mapZoom * factor));
   _updateMapTransform();
 }
 
 function _updateMapTransform() {
   const z = STATE.mapZoom;
-  const cw = EL.mapCanvas.offsetWidth;
-  const ch = EL.mapCanvas.offsetHeight;
+  const cw = EL.mapCanvas.width, ch = EL.mapCanvas.height;
   const ox = (cw * (1 - z)) / 2 + STATE.mapPanX;
   const oy = (ch * (1 - z)) / 2 + STATE.mapPanY;
-  EL.mapCanvas.style.transition = 'transform 0.08s ease-out';
   EL.mapCanvas.style.transform       = `translate(${ox}px, ${oy}px) scale(${z})`;
   EL.mapCanvas.style.transformOrigin = '50% 50%';
-  if (EL.zoomLevel) EL.zoomLevel.textContent = `${z.toFixed(2)}×`;
+  if (EL.zoomLevel) EL.zoomLevel.textContent = `${z.toFixed(1)}×`;
 }
 
-// ── Scroll-wheel zoom toward cursor ──────────────────────────────────────────
+// ── Scroll-wheel zoom ─────────────────────────────────────────────────────────
 EL.mapOuter && EL.mapOuter.addEventListener('wheel', e => {
   e.preventDefault();
-  applyZoom(e.deltaY < 0 ? 1.12 : 0.89, e.clientX, e.clientY);
+  applyZoom(e.deltaY < 0 ? 1.12 : 0.89);
 }, { passive: false });
 
 // ── Pan gestures on map canvas ────────────────────────────────────────────────
@@ -457,7 +387,7 @@ EL.mapCanvas.addEventListener('pointerdown', e => {
     return;
   }
   if (!STATE.mapMeta) return;
-  STATE.dragStart = canvasToWorld(e.clientX, e.clientY, STATE.mapMeta);
+  STATE.dragStart = canvasToWorld(e, STATE.mapMeta);
 });
 
 EL.mapCanvas.addEventListener('pointermove', e => {
@@ -470,19 +400,9 @@ EL.mapCanvas.addEventListener('pointermove', e => {
     _updateMapTransform();
     return;
   }
-  if (STATE.dragStart && STATE.mapMeta && STATE.mapTool === 'start') {
-    const cur = canvasToWorld(e.clientX, e.clientY, STATE.mapMeta);
-    if (cur) STATE.headingPrev = Math.atan2(cur.y - STATE.dragStart.y, cur.x - STATE.dragStart.x);
-  }
-  if (STATE.mapMeta) {
-    const w = canvasToWorld(e.clientX, e.clientY, STATE.mapMeta);
-    STATE._cursorWorld = w;
-    const hud = document.getElementById('map-cursor-hud');
-    if (hud && w) {
-      hud.style.display = 'block';
-      hud.textContent = `X: ${w.x.toFixed(2)} m   Y: ${w.y.toFixed(2)} m`;
-    }
-  }
+  if (!STATE.dragStart || !STATE.mapMeta || STATE.mapTool !== 'start') return;
+  const cur = canvasToWorld(e, STATE.mapMeta);
+  STATE.headingPrev = Math.atan2(cur.y - STATE.dragStart.y, cur.x - STATE.dragStart.x);
 });
 
 EL.mapCanvas.addEventListener('pointerup', e => {
@@ -493,10 +413,9 @@ EL.mapCanvas.addEventListener('pointerup', e => {
     return;
   }
   if (!STATE.mapMeta) return;
-  const pt = canvasToWorld(e.clientX, e.clientY, STATE.mapMeta);
-  if (!pt) return;
+  const pt = canvasToWorld(e, STATE.mapMeta);
   if (STATE.mapTool === 'goal') {
-    api('/api/navigate/goal', 'POST', { x: pt.x, y: pt.y }).catch(() => {});
+    STATE.pendingGoal = { x: pt.x, y: pt.y };
   } else if (STATE.mapTool === 'start') {
     const start = STATE.dragStart || pt;
     api('/api/pose', 'POST', { x: start.x, y: start.y, theta: STATE.headingPrev }).catch(() => {});
@@ -506,47 +425,21 @@ EL.mapCanvas.addEventListener('pointerup', e => {
   STATE.dragStart = null;
 });
 
-EL.mapCanvas.addEventListener('pointerleave', () => {
-  const hud = document.getElementById('map-cursor-hud');
-  if (hud) hud.style.display = 'none';
-  STATE._cursorWorld = null;
-});
-
 EL.mapCanvas.addEventListener('pointercancel', () => {
-  STATE.mapDragging = false;
-  STATE.mapDragLast = null;
+  STATE.mapDragging = false; STATE.mapDragLast = null;
 });
 
-// ── ACCURATE canvasToWorld ────────────────────────────────────────────────────
-// Inverts the CSS transform: translate(ox,oy) scale(z) with transformOrigin=center
-// to get true canvas pixels, then converts to world coordinates.
-function canvasToWorld(clientX, clientY, meta) {
-  if (!meta) return null;
-  const outer = EL.mapOuter.getBoundingClientRect();
-  const z = STATE.mapZoom;
-  const cw = EL.mapCanvas.offsetWidth;
-  const ch = EL.mapCanvas.offsetHeight;
-  const outerCx = outer.width / 2;
-  const outerCy = outer.height / 2;
-  const canvasLeft = outerCx - cw * z / 2 + STATE.mapPanX;
-  const canvasTop = outerCy - ch * z / 2 + STATE.mapPanY;
-  const relX = clientX - outer.left;
-  const relY = clientY - outer.top;
-  const cssPx = (relX - canvasLeft) / z;
-  const cssPy = (relY - canvasTop) / z;
+function canvasToWorld(e, meta) {
+  const rect = EL.mapCanvas.getBoundingClientRect();
+  // Account for zoom/pan — getBoundingClientRect gives display coords
+  const scaleX = EL.mapCanvas.width  / rect.width;
+  const scaleY = EL.mapCanvas.height / rect.height;
+  const cx = Math.round((e.clientX - rect.left) * scaleX);
+  const cy = Math.round((e.clientY - rect.top)  * scaleY);
   return {
-    x: cssPx / cw * meta.width * meta.resolution + meta.origin[0],
-    y: cssPy / ch * meta.height * meta.resolution + meta.origin[1],
+    x: cx * meta.resolution + meta.origin[0],
+    y: cy * meta.resolution + meta.origin[1],
   };
-}
-
-// ── worldToCanvas ─────────────────────────────────────────────────────────────
-function worldToCanvas(wx, wy, meta) {
-  const cw = EL.mapCanvas.width / DPR;
-  const ch = EL.mapCanvas.height / DPR;
-  const px = (wx - meta.origin[0]) / meta.resolution / meta.width * cw;
-  const py = (wy - meta.origin[1]) / meta.resolution / meta.height * ch;
-  return { cx: px, cy: py };
 }
 
 // ── POI — add flow ────────────────────────────────────────────────────────────
@@ -628,7 +521,6 @@ async function refreshPois() {
     const pois = data.pois || [];
     if (!pois.length) {
       EL.poiSidebarList.innerHTML = '<p class="hint">No POIs yet. Select "+POI" tool and click the map.</p>';
-      STATE._pois = [];
       return;
     }
     EL.poiSidebarList.innerHTML = '';
@@ -643,6 +535,7 @@ async function refreshPois() {
       `;
       EL.poiSidebarList.appendChild(row);
     });
+    // Bind buttons
     EL.poiSidebarList.querySelectorAll('.poi-nav-btn').forEach(btn => {
       btn.addEventListener('click', () => api(`/api/poi/${btn.dataset.id}/navigate`, 'POST', {}).catch(err => alert(err.message)));
     });
@@ -652,6 +545,7 @@ async function refreshPois() {
         if (poi) _openPoiEdit(poi);
       });
     });
+    // Store pois for map canvas
     STATE._pois = pois;
   } catch (_) {}
 }
@@ -947,407 +841,133 @@ async function refreshMapList() {
   } catch (_) {}
 }
 
-// ── Map canvas render (v6 - HiDPI + accurate transforms) ────────────────────
+// ── Map canvas render ─────────────────────────────────────────────────────────
 async function refreshMap() {
   try {
     const meta = await api('/api/map/data');
     STATE.mapMeta = meta;
-    if (meta.scan) STATE._lastScanPts = meta.scan;
     drawMap(meta);
   } catch (_) {}
 }
 
 async function drawMap(meta) {
-  const outer = EL.mapOuter;
-  const cssW = outer.clientWidth || 820;
-  const cssH = outer.clientHeight || 820;
-
-  // Setup HiDPI canvas
-  if (EL.mapCanvas.width !== cssW || EL.mapCanvas.height !== cssH) {
-    EL.mapCanvas.width = cssW;
-    EL.mapCanvas.height = cssH;
-    // Reset context transform after resize
-    mapCtx.setTransform(1, 0, 0, 1, 0, 0);
-    mapCtx.scale(DPR, DPR);
-  }
-
-  const cw = cssW;
-  const ch = cssH;
-
+  const cw = EL.mapCanvas.width, ch = EL.mapCanvas.height;
   mapCtx.clearRect(0, 0, cw, ch);
-  mapCtx.fillStyle = '#0d1422';
+  mapCtx.fillStyle = '#1a2236';
   mapCtx.fillRect(0, 0, cw, ch);
 
-  // Base map image with high quality rendering
   if (meta.image_png_b64) {
-    if (STATE._mapImgSrc !== meta.image_png_b64) {
-      STATE._mapImgSrc = meta.image_png_b64;
-      STATE._mapImg = null;
-      const img = new Image();
-      await new Promise(res => { img.onload = res; img.src = 'data:image/png;base64,' + meta.image_png_b64; });
-      STATE._mapImg = img;
-    }
-    if (STATE._mapImg) {
-      mapCtx.imageSmoothingEnabled = true;
-      mapCtx.imageSmoothingQuality = 'high';
-      mapCtx.drawImage(STATE._mapImg, 0, 0, cw, ch);
-    }
+    const img = new Image();
+    await new Promise(res => { img.onload = res; img.src = 'data:image/png;base64,' + meta.image_png_b64; });
+    mapCtx.drawImage(img, 0, 0, cw, ch);
   }
 
-  // Pixel coordinate helpers - now using CSS pixels
-  const pxToC = p => ({
-    cx: (p.x / meta.width) * cw,
-    cy: (p.y / meta.height) * ch,
-  });
+  const toC = p => ({ x: (p.x / meta.width) * cw, y: (p.y / meta.height) * ch });
 
-  // GRID with world-coordinate labels
-  const res = meta.resolution || 0.05;
-  const ox = meta.origin ? meta.origin[0] : -24;
-  const oy = meta.origin ? meta.origin[1] : -24;
-  const ppm = cw / (meta.width * res);
-  const gridM = STATE.mapZoom >= 2.0 ? 1.0 : 5.0;
-  const step = gridM / res;
-
+  // Grid (every 1 m = 20 cells at 0.05 m/cell)
+  const step = Math.max(10, Math.round(1.0 / meta.resolution));
   mapCtx.save();
-  mapCtx.strokeStyle = gridM === 1.0 ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.10)';
-  mapCtx.lineWidth = 1;
-
-  const startCellX = Math.ceil((-ox) / res / step) * step;
-  for (let cx2 = startCellX; cx2 <= meta.width; cx2 += step) {
-    const px = (cx2 / meta.width) * cw;
+  mapCtx.strokeStyle = 'rgba(255,255,255,0.04)'; mapCtx.lineWidth = 1;
+  for (let x = 0; x <= meta.width; x += step) {
+    const px = (x / meta.width) * cw;
     mapCtx.beginPath(); mapCtx.moveTo(px, 0); mapCtx.lineTo(px, ch); mapCtx.stroke();
   }
-  const startCellY = Math.ceil((-oy) / res / step) * step;
-  for (let cy2 = startCellY; cy2 <= meta.height; cy2 += step) {
-    const py = (cy2 / meta.height) * ch;
+  for (let y = 0; y <= meta.height; y += step) {
+    const py = (y / meta.height) * ch;
     mapCtx.beginPath(); mapCtx.moveTo(0, py); mapCtx.lineTo(cw, py); mapCtx.stroke();
-  }
-
-  // Origin crosshair
-  const originPx = { cx: (-ox / res / meta.width) * cw, cy: (-oy / res / meta.height) * ch };
-  mapCtx.strokeStyle = 'rgba(56,189,248,0.25)';
-  mapCtx.lineWidth = 1.5;
-  mapCtx.setLineDash([4, 4]);
-  mapCtx.beginPath(); mapCtx.moveTo(originPx.cx, 0); mapCtx.lineTo(originPx.cx, ch); mapCtx.stroke();
-  mapCtx.beginPath(); mapCtx.moveTo(0, originPx.cy); mapCtx.lineTo(cw, originPx.cy); mapCtx.stroke();
-  mapCtx.setLineDash([]);
-
-  // World coord labels
-  mapCtx.fillStyle = 'rgba(148,163,184,0.55)';
-  mapCtx.font = '10px monospace';
-  mapCtx.textAlign = 'left';
-  for (let cx2 = startCellX; cx2 <= meta.width; cx2 += step) {
-    const px = (cx2 / meta.width) * cw;
-    const wx = cx2 * res + ox;
-    mapCtx.fillText(`${wx.toFixed(0)}m`, px + 2, 12);
-  }
-  mapCtx.textAlign = 'right';
-  for (let cy2 = startCellY; cy2 <= meta.height; cy2 += step) {
-    const py = (cy2 / meta.height) * ch;
-    const wy = cy2 * res + oy;
-    mapCtx.fillText(`${wy.toFixed(0)}m`, cw - 2, py - 2);
   }
   mapCtx.restore();
 
-  // COSTMAP INFLATION OVERLAY
-  if (STATE.showCostmap !== false && meta.image_png_b64 && STATE._mapImg) {
-    const inflW = Math.round(cw / 4);
-    const inflH = Math.round(ch / 4);
-    const ofc = document.createElement('canvas');
-    ofc.width = inflW; ofc.height = inflH;
-    const ofCtx = ofc.getContext('2d');
-    ofCtx.imageSmoothingEnabled = false;
-    ofCtx.drawImage(STATE._mapImg, 0, 0, inflW, inflH);
-    const id = ofCtx.getImageData(0, 0, inflW, inflH);
-    const d = id.data;
-    const inflOfc = document.createElement('canvas');
-    inflOfc.width = inflW; inflOfc.height = inflH;
-    const inflCtx = inflOfc.getContext('2d');
-    inflCtx.shadowColor = 'rgba(248,113,113,0.55)';
-    inflCtx.shadowBlur = 6;
-    inflCtx.fillStyle = 'rgba(248,113,113,0.70)';
-    for (let py = 0; py < inflH; py++) {
-      for (let px = 0; px < inflW; px++) {
-        const i = (py * inflW + px) * 4;
-        if (d[i] < 60 && d[i + 3] > 128) {
-          inflCtx.fillRect(px, py, 1, 1);
-        }
-      }
-    }
-    mapCtx.save();
-    mapCtx.globalAlpha = 0.45;
-    mapCtx.imageSmoothingEnabled = true;
-    mapCtx.imageSmoothingQuality = 'high';
-    mapCtx.drawImage(inflOfc, 0, 0, cw, ch);
-    mapCtx.globalAlpha = 1;
-    mapCtx.restore();
-  }
-
-  // SCAN SWEEP FAN
-  if (STATE.showSweep !== false && meta.scan?.length && meta.pose) {
-    const poseC = pxToC(meta.pose);
-    const pts = meta.scan;
-    let minA = Infinity, maxA = -Infinity;
-    pts.forEach(p => {
-      const dx = (p.x / meta.width) * cw - poseC.cx;
-      const dy = (p.y / meta.height) * ch - poseC.cy;
-      const a = Math.atan2(dy, dx);
-      if (a < minA) minA = a;
-      if (a > maxA) maxA = a;
-    });
-    if (isFinite(minA) && maxA - minA < Math.PI * 1.8) {
-      const maxR = 120;
-      mapCtx.save();
-      mapCtx.globalAlpha = 0.07;
-      mapCtx.fillStyle = '#34d399';
-      mapCtx.beginPath();
-      mapCtx.moveTo(poseC.cx, poseC.cy);
-      mapCtx.arc(poseC.cx, poseC.cy, maxR, minA, maxA);
-      mapCtx.closePath();
-      mapCtx.fill();
-      mapCtx.globalAlpha = 1;
-      mapCtx.restore();
-    }
-  }
-
-  // SCAN POINTS
+  // Scan points
   if (meta.scan?.length) {
-    const ptSize = Math.max(1.5, 3 * Math.min(1, STATE.mapZoom));
-    mapCtx.save();
-    mapCtx.fillStyle = 'rgba(52,211,153,0.80)';
-    mapCtx.shadowColor = 'rgba(52,211,153,0.35)';
-    mapCtx.shadowBlur = 3;
-    meta.scan.forEach(p => {
-      const c = pxToC(p);
-      mapCtx.beginPath();
-      mapCtx.arc(c.cx, c.cy, ptSize, 0, Math.PI * 2);
-      mapCtx.fill();
-    });
-    mapCtx.shadowBlur = 0;
-    mapCtx.restore();
+    mapCtx.fillStyle = 'rgba(52,211,153,0.85)';
+    meta.scan.forEach(p => { const c = toC(p); mapCtx.fillRect(c.x-1.5, c.y-1.5, 3, 3); });
   }
 
-  // PATH with distance label
+  // Path
   if (meta.path?.length > 1) {
     mapCtx.save();
-    mapCtx.strokeStyle = '#38bdf8';
-    mapCtx.lineWidth = 2.5;
-    mapCtx.lineJoin = 'round';
-    mapCtx.shadowColor = 'rgba(56,189,248,0.5)';
-    mapCtx.shadowBlur = 10;
+    mapCtx.strokeStyle = '#38bdf8'; mapCtx.lineWidth = 3;
+    mapCtx.shadowColor = 'rgba(56,189,248,0.4)'; mapCtx.shadowBlur = 12;
     mapCtx.beginPath();
-    meta.path.forEach((p, i) => {
-      const c = pxToC(p);
-      if (i === 0) mapCtx.moveTo(c.cx, c.cy); else mapCtx.lineTo(c.cx, c.cy);
-    });
-    mapCtx.stroke();
-    if (meta.path.length >= 2) {
-      let totalDist = 0;
-      for (let i = 1; i < meta.path.length; i++) {
-        const a = meta.path[i - 1], b = meta.path[i];
-        const dx = (b.x - a.x) * res;
-        const dy = (b.y - a.y) * res;
-        totalDist += Math.hypot(dx, dy);
-      }
-      const mid = meta.path[Math.floor(meta.path.length / 2)];
-      const mc = pxToC(mid);
-      mapCtx.shadowBlur = 0;
-      mapCtx.fillStyle = '#38bdf8';
-      mapCtx.font = 'bold 11px monospace';
-      mapCtx.textAlign = 'center';
-      mapCtx.fillText(`${totalDist.toFixed(1)} m`, mc.cx, mc.cy - 8);
-    }
-    mapCtx.restore();
+    meta.path.forEach((p, i) => { const c = toC(p); if (i === 0) mapCtx.moveTo(c.x, c.y); else mapCtx.lineTo(c.x, c.y); });
+    mapCtx.stroke(); mapCtx.restore();
   }
 
-  // GOAL MARKER
-  if (meta.goal) {
-    const c = pxToC(meta.goal);
+  // Pending goal (placed on map but mission not yet started)
+  if (STATE.pendingGoal && STATE.mapMeta) {
+    const c = toC(STATE.pendingGoal);
     mapCtx.save();
-    mapCtx.globalAlpha = 0.35;
-    mapCtx.strokeStyle = '#fbbf24';
-    mapCtx.lineWidth = 1.5;
+    mapCtx.strokeStyle = '#60a5fa'; mapCtx.lineWidth = 2;
+    mapCtx.shadowColor = '#60a5fa'; mapCtx.shadowBlur = 8;
+    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 7, 0, Math.PI * 2); mapCtx.stroke();
+    mapCtx.setLineDash([4, 3]);
     mapCtx.beginPath();
-    mapCtx.arc(c.cx, c.cy, 18, 0, Math.PI * 2);
-    mapCtx.stroke();
-    mapCtx.globalAlpha = 1;
-    mapCtx.strokeStyle = '#fbbf24';
-    mapCtx.lineWidth = 2;
-    mapCtx.shadowColor = '#fbbf24';
-    mapCtx.shadowBlur = 12;
+    mapCtx.moveTo(c.x, c.y-12); mapCtx.lineTo(c.x, c.y+12);
+    mapCtx.moveTo(c.x-12, c.y); mapCtx.lineTo(c.x+12, c.y);
+    mapCtx.stroke(); mapCtx.restore();
+  }
+
+  // Goal
+  if (meta.goal) {
+    const c = toC(meta.goal);
+    mapCtx.save();
+    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 2.5;
+    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 10;
+    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 8, 0, Math.PI * 2); mapCtx.stroke();
     mapCtx.beginPath();
-    mapCtx.arc(c.cx, c.cy, 8, 0, Math.PI * 2);
-    mapCtx.moveTo(c.cx, c.cy - 18);
-    mapCtx.lineTo(c.cx, c.cy + 18);
-    mapCtx.moveTo(c.cx - 18, c.cy);
-    mapCtx.lineTo(c.cx + 18, c.cy);
-    mapCtx.stroke();
-    mapCtx.shadowBlur = 0;
-    mapCtx.fillStyle = '#fbbf24';
-    mapCtx.font = 'bold 10px monospace';
-    mapCtx.textAlign = 'center';
-    mapCtx.fillText('GOAL', c.cx, c.cy - 22);
-    mapCtx.restore();
+    mapCtx.moveTo(c.x, c.y-14); mapCtx.lineTo(c.x, c.y+14);
+    mapCtx.moveTo(c.x-14, c.y); mapCtx.lineTo(c.x+14, c.y);
+    mapCtx.stroke(); mapCtx.restore();
   }
 
   // POIs
   const pois = meta.pois || [];
   pois.forEach(poi => {
-    const c = pxToC({ x: poi.px, y: poi.py });
+    const cx = (poi.px / meta.width)  * cw;
+    const cy = (poi.py / meta.height) * ch;
+    // Halo
     mapCtx.save();
-    mapCtx.fillStyle = 'rgba(251,191,36,0.14)';
-    mapCtx.beginPath();
-    mapCtx.arc(c.cx, c.cy, 16, 0, Math.PI * 2);
-    mapCtx.fill();
-    mapCtx.strokeStyle = '#fbbf24';
-    mapCtx.lineWidth = 2;
-    mapCtx.shadowColor = '#fbbf24';
-    mapCtx.shadowBlur = 8;
-    mapCtx.beginPath();
-    mapCtx.arc(c.cx, c.cy, 10, 0, Math.PI * 2);
-    mapCtx.stroke();
-    mapCtx.shadowBlur = 0;
+    mapCtx.fillStyle = 'rgba(251,191,36,0.18)';
+    mapCtx.beginPath(); mapCtx.arc(cx, cy, 14, 0, Math.PI*2); mapCtx.fill();
+    // Border ring
+    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 2;
+    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 8;
+    mapCtx.beginPath(); mapCtx.arc(cx, cy, 10, 0, Math.PI*2); mapCtx.stroke();
     mapCtx.restore();
+    // Icon emoji
     mapCtx.font = '13px sans-serif';
-    mapCtx.textAlign = 'center';
-    mapCtx.textBaseline = 'middle';
-    const icons = { gazebo: '⛺', waypoint: '📍', dock: '🔌', custom: '⭐' };
-    mapCtx.fillText(icons[poi.kind] || '⭐', c.cx, c.cy);
+    mapCtx.textAlign = 'center'; mapCtx.textBaseline = 'middle';
+    const icons = { gazebo:'⛺', waypoint:'📍', dock:'🔌', custom:'⭐' };
+    mapCtx.fillText(icons[poi.kind] || '⭐', cx, cy);
+    // Label below
     mapCtx.save();
-    mapCtx.font = 'bold 9px monospace';
+    mapCtx.font = 'bold 9px sans-serif';
     mapCtx.fillStyle = '#fbbf24';
-    mapCtx.textAlign = 'center';
-    mapCtx.textBaseline = 'top';
-    mapCtx.shadowColor = '#000';
-    mapCtx.shadowBlur = 3;
-    mapCtx.fillText(poi.label, c.cx, c.cy + 13);
+    mapCtx.textAlign = 'center'; mapCtx.textBaseline = 'top';
+    mapCtx.shadowColor = '#000'; mapCtx.shadowBlur = 3;
+    mapCtx.fillText(poi.label, cx, cy + 12);
     mapCtx.restore();
   });
 
-  // ROBOT with accurate heading
+  // Robot — scaled rectangle matching physical body (520×500 mm)
+  // In map pixel space: pixPerM = cw / (meta.width * meta.resolution)
   if (meta.pose) {
-    const c = pxToC(meta.pose);
-    const th = meta.pose.theta;
-    const rL = 0.520 / 2 * ppm;
-    const rW = 0.500 / 2 * ppm;
-
+    const c   = toC(meta.pose);
+    const th  = meta.pose.theta;
+    const ppm = cw / (meta.width * (meta.resolution || 0.05));  // pixels per metre
+    const rL  = 0.520 / 2 * ppm;   // half-length px (front-back)
+    const rW  = 0.500 / 2 * ppm;   // half-width  px (left-right)
     mapCtx.save();
-    mapCtx.translate(c.cx, c.cy);
+    mapCtx.translate(c.x, c.y);
+    // Map convention: x=right, y=down on canvas; robot x=fwd mapped to canvas x=right at theta=0
     mapCtx.rotate(th);
-
-    const bodyGrad = mapCtx.createLinearGradient(-rW, -rL, rW, rL);
-    bodyGrad.addColorStop(0, 'rgba(56,189,248,0.18)');
-    bodyGrad.addColorStop(1, 'rgba(56,189,248,0.06)');
-    mapCtx.fillStyle = bodyGrad;
+    // Body fill
+    mapCtx.fillStyle = 'rgba(56,189,248,0.12)';
     mapCtx.fillRect(-rW, -rL, rW * 2, rL * 2);
-    mapCtx.strokeStyle = 'rgba(56,189,248,0.60)';
-    mapCtx.lineWidth = 1.5;
+    // Body outline
+    mapCtx.strokeStyle = 'rgba(56,189,248,0.55)'; mapCtx.lineWidth = 1.5;
     mapCtx.strokeRect(-rW, -rL, rW * 2, rL * 2);
-    mapCtx.strokeStyle = '#34d399';
-    mapCtx.lineWidth = 3;
-    mapCtx.shadowColor = 'rgba(52,211,153,0.6)';
-    mapCtx.shadowBlur = 8;
-    mapCtx.beginPath();
-    mapCtx.moveTo(-rW, rL);
-    mapCtx.lineTo(rW, rL);
-    mapCtx.stroke();
-    mapCtx.shadowBlur = 0;
-
-    const arLen = Math.max(6, rL * 0.65);
-    const arBase = rL - arLen * 0.15;
-    mapCtx.fillStyle = '#38bdf8';
-    mapCtx.shadowColor = 'rgba(56,189,248,0.7)';
-    mapCtx.shadowBlur = 12;
-    mapCtx.beginPath();
-    mapCtx.moveTo(0, arBase + arLen * 0.1);
-    mapCtx.lineTo(-arLen * 0.45, arBase - arLen * 0.8);
-    mapCtx.lineTo(arLen * 0.45, arBase - arLen * 0.8);
-    mapCtx.closePath();
-    mapCtx.fill();
-    mapCtx.shadowBlur = 0;
-    mapCtx.fillStyle = '#fff';
-    mapCtx.beginPath();
-    mapCtx.arc(0, 0, 3, 0, Math.PI * 2);
-    mapCtx.fill();
-    mapCtx.restore();
-
-    const headingDeg = ((th * 180 / Math.PI) % 360 + 360) % 360;
-    mapCtx.save();
-    mapCtx.fillStyle = '#94a3b8';
-    mapCtx.font = '9px monospace';
-    mapCtx.textAlign = 'center';
-    mapCtx.fillText(`${headingDeg.toFixed(0)}°`, c.cx, c.cy + rL + 14);
-    mapCtx.restore();
-  }
-
-  // SCALE BAR
-  {
-    const pixelsPerM = cw / (meta.width * res);
-    const niceM = pixelsPerM > 40 ? 1 : pixelsPerM > 10 ? 2 : 5;
-    const barPx = niceM * pixelsPerM;
-
-    mapCtx.save();
-    mapCtx.fillStyle = 'rgba(13,20,34,0.65)';
-    mapCtx.fillRect(8, ch - 36, barPx + 50, 28);
-    mapCtx.fillStyle = 'rgba(255,255,255,0.90)';
-    mapCtx.fillRect(12, ch - 22, barPx, 4);
-    mapCtx.fillRect(12, ch - 26, 2, 12);
-    mapCtx.fillRect(12 + barPx - 2, ch - 26, 2, 12);
-    mapCtx.fillStyle = 'rgba(255,255,255,0.85)';
-    mapCtx.font = '9px monospace';
-    mapCtx.textAlign = 'left';
-    mapCtx.fillText('0', 12, ch - 26);
-    mapCtx.fillText(`${niceM} m`, 12 + barPx + 3, ch - 18);
-    mapCtx.fillStyle = 'rgba(99,130,180,0.55)';
-    mapCtx.textAlign = 'right';
-    mapCtx.fillText(`${(res * 100) | 0} cm/cell`, cw - 8, ch - 8);
-    mapCtx.restore();
-  }
-
-  // MINIMAP THUMBNAIL
-  if (STATE.showMinimap !== false && STATE.mapZoom > 1.5 && STATE._mapImg) {
-    const mw = 120, mh = 120;
-    const mx = cw - mw - 8, my = 8;
-
-    mapCtx.save();
-    mapCtx.fillStyle = 'rgba(13,20,34,0.82)';
-    mapCtx.fillRect(mx - 2, my - 2, mw + 4, mh + 4);
-    mapCtx.strokeStyle = 'rgba(56,189,248,0.40)';
-    mapCtx.lineWidth = 1;
-    mapCtx.strokeRect(mx - 2, my - 2, mw + 4, mh + 4);
-    mapCtx.imageSmoothingEnabled = true;
-    mapCtx.imageSmoothingQuality = 'medium';
-    mapCtx.drawImage(STATE._mapImg, mx, my, mw, mh);
-
-    const vFracW = 1 / STATE.mapZoom;
-    const vFracH = 1 / STATE.mapZoom;
-    const vCx = 0.5 - STATE.mapPanX / (cw * STATE.mapZoom);
-    const vCy = 0.5 - STATE.mapPanY / (ch * STATE.mapZoom);
-    const vrX = mx + (vCx - vFracW / 2) * mw;
-    const vrY = my + (vCy - vFracH / 2) * mh;
-    const vrW = vFracW * mw;
-    const vrH = vFracH * mh;
-    mapCtx.strokeStyle = '#fbbf24';
-    mapCtx.lineWidth = 1.5;
-    mapCtx.strokeRect(
-      Math.max(mx, vrX), Math.max(my, vrY),
-      Math.min(vrW, mw - Math.max(0, vrX - mx)),
-      Math.min(vrH, mh - Math.max(0, vrY - my))
-    );
-
-    if (meta.pose) {
-      const rc = pxToC(meta.pose);
-      const rmx = mx + (rc.cx / cw) * mw;
-      const rmy = my + (rc.cy / ch) * mh;
-      mapCtx.fillStyle = '#38bdf8';
-      mapCtx.beginPath();
-      mapCtx.arc(rmx, rmy, 3, 0, Math.PI * 2);
-      mapCtx.fill();
-    }
-
-    mapCtx.restore();
-  }
-}
     // Front edge (green)
     mapCtx.strokeStyle = '#34d399'; mapCtx.lineWidth = 2.5;
     mapCtx.shadowColor = 'rgba(52,211,153,0.5)'; mapCtx.shadowBlur = 8;
@@ -1388,283 +1008,218 @@ async function drawMap(meta) {
   mapCtx.restore();
 }
 
-// ── Lidar render (v6 - HiDPI) ────────────────────────────────────────────────
+// ── Lidar render ──────────────────────────────────────────────────────────────
 async function refreshLidar() {
   try {
     const data = await api('/api/lidar');
-    if (EL.radarCanvas) drawRadar(data);
-    if (EL.sceneCanvas) drawScene(data);
+    drawRadar(data);
+    drawScene(data);
     const hasRoute = data.obstacle_stop && data.avoidance_route?.length > 0;
     EL.avoidBadge.style.display = hasRoute ? '' : 'none';
   } catch (_) {}
 }
 
-function _initCanvas(canvas) {
-  const outer = canvas.parentElement;
-  const cssW = outer ? outer.clientWidth : canvas.width / DPR;
-  const cssH = outer ? outer.clientHeight : canvas.height / DPR;
-  if (!cssW || !cssH) return { cw: canvas.width, ch: canvas.height };
-  const bw = Math.round(cssW * DPR);
-  const bh = Math.round(cssH * DPR);
-  if (canvas.width !== bw || canvas.height !== bh) {
-    canvas.width = bw;
-    canvas.height = bh;
-    canvas.style.width = cssW + 'px';
-    canvas.style.height = cssH + 'px';
-  }
-  return { cw: bw, ch: bh };
-}
-
 function drawRadar(data) {
-  const { cw, ch } = _initCanvas(EL.radarCanvas);
+  const cw = EL.radarCanvas.width, ch = EL.radarCanvas.height;
   const cx = cw / 2, cy = ch / 2;
   const maxRange = data.max_range || 8.0;
-  const scale = (Math.min(cw, ch) / 2 - 18 * DPR) / maxRange;
+  const scale = (Math.min(cw, ch) / 2 - 14) / maxRange;   // px per metre
 
   radarCtx.clearRect(0, 0, cw, ch);
-
-  const bgGrad = radarCtx.createRadialGradient(cx, cy, 0, cx, cy, Math.min(cw, ch) / 2);
-  bgGrad.addColorStop(0, '#111c2e');
-  bgGrad.addColorStop(1, '#0d1422');
-  radarCtx.fillStyle = bgGrad;
+  radarCtx.fillStyle = '#0d1422';
   radarCtx.fillRect(0, 0, cw, ch);
 
-  // Distance rings
-  const rings = [
-    { r: 0.5, lbl: '50cm', dash: [4 * DPR, 4 * DPR], col: 'rgba(251,191,36,0.25)', tc: 'rgba(251,191,36,0.80)' },
-    { r: 1.0, lbl: '1 m', dash: [], col: 'rgba(120,150,200,0.30)', tc: 'rgba(140,175,230,0.80)' },
-    { r: 1.5, lbl: '1.5m', dash: [], col: 'rgba(99,130,180,0.22)', tc: 'rgba(140,175,230,0.65)' },
-    { r: 2, lbl: '2 m', dash: [], col: 'rgba(99,130,180,0.18)', tc: 'rgba(99,130,180,0.55)' },
-    { r: 3, lbl: '3 m', dash: [], col: 'rgba(99,130,180,0.16)', tc: 'rgba(99,130,180,0.50)' },
-    { r: 4, lbl: '4 m', dash: [], col: 'rgba(99,130,180,0.14)', tc: 'rgba(99,130,180,0.48)' },
-    { r: 5, lbl: '5 m', dash: [], col: 'rgba(99,130,180,0.13)', tc: 'rgba(99,130,180,0.45)' },
-    { r: 6, lbl: '6 m', dash: [], col: 'rgba(99,130,180,0.13)', tc: 'rgba(99,130,180,0.45)' },
-    { r: 8, lbl: '8 m', dash: [], col: 'rgba(99,130,180,0.12)', tc: 'rgba(99,130,180,0.42)' },
-  ];
-
-  rings.forEach(({ r, lbl, dash, col, tc }) => {
+  // ── Distance rings ─────────────────────────────────────────────────────────
+  // Inner rings: 50 cm, 100 cm, 150 cm  → labelled in centimetres
+  // Outer rings: 2 m … 8 m              → labelled in metres
+  [
+    { r: 0.5,  lbl: '50 cm',  dash: [4,4], col: 'rgba(251,191,36,0.22)',   tc: 'rgba(251,191,36,0.75)' },
+    { r: 1.0,  lbl: '100 cm', dash: [],    col: 'rgba(120,150,200,0.28)',  tc: 'rgba(140,175,230,0.75)' },
+    { r: 1.5,  lbl: '150 cm', dash: [],    col: 'rgba(99,130,180,0.20)',   tc: 'rgba(140,175,230,0.60)' },
+    { r: 2,    lbl: '2 m',    dash: [],    col: 'rgba(99,130,180,0.16)',   tc: 'rgba(99,130,180,0.50)' },
+    { r: 3,    lbl: '3 m',    dash: [],    col: 'rgba(99,130,180,0.14)',   tc: 'rgba(99,130,180,0.45)' },
+    { r: 4,    lbl: '4 m',    dash: [],    col: 'rgba(99,130,180,0.14)',   tc: 'rgba(99,130,180,0.45)' },
+    { r: 5,    lbl: '5 m',    dash: [],    col: 'rgba(99,130,180,0.13)',   tc: 'rgba(99,130,180,0.40)' },
+    { r: 6,    lbl: '6 m',    dash: [],    col: 'rgba(99,130,180,0.13)',   tc: 'rgba(99,130,180,0.40)' },
+    { r: 8,    lbl: '8 m',    dash: [],    col: 'rgba(99,130,180,0.12)',   tc: 'rgba(99,130,180,0.38)' },
+  ].forEach(({ r, lbl, dash, col, tc }) => {
     const rPx = r * scale;
     if (rPx > Math.min(cw, ch) / 2 - 4) return;
     radarCtx.setLineDash(dash);
     radarCtx.strokeStyle = col;
-    radarCtx.lineWidth = DPR;
+    radarCtx.lineWidth = 1;
     radarCtx.beginPath();
     radarCtx.arc(cx, cy, rPx, 0, Math.PI * 2);
     radarCtx.stroke();
     radarCtx.setLineDash([]);
     radarCtx.fillStyle = tc;
-    radarCtx.font = `${r < 2 ? 9 : 10}px monospace`;
+    radarCtx.font = r < 2 ? '8px monospace' : '9px sans-serif';
     radarCtx.textAlign = 'left';
     radarCtx.fillText(lbl, cx + rPx + 3, cy - 3);
   });
 
-  // N/E/S/W labels
-  const dirs = [[-Math.PI / 2, 'N'], [0, 'E'], [Math.PI / 2, 'S'], [Math.PI, 'W']];
-  dirs.forEach(([a, lbl]) => {
-    const outer2 = Math.min(cw, ch) / 2 - 6;
-    radarCtx.fillStyle = 'rgba(148,163,184,0.55)';
-    radarCtx.font = `bold ${9 * DPR}px monospace`;
-    radarCtx.textAlign = 'center';
-    radarCtx.textBaseline = 'middle';
-    radarCtx.fillText(lbl, cx + Math.cos(a) * outer2, cy + Math.sin(a) * outer2);
-  });
-
   // Crosshairs
-  radarCtx.strokeStyle = 'rgba(99,130,180,0.20)';
-  radarCtx.lineWidth = DPR;
+  radarCtx.strokeStyle = 'rgba(99,130,180,0.18)';
+  radarCtx.lineWidth = 1;
   radarCtx.beginPath();
-  radarCtx.moveTo(cx, 4 * DPR);
-  radarCtx.lineTo(cx, ch - 4 * DPR);
-  radarCtx.moveTo(4 * DPR, cy);
-  radarCtx.lineTo(cw - 4 * DPR, cy);
+  radarCtx.moveTo(cx, 4); radarCtx.lineTo(cx, ch - 4);
+  radarCtx.moveTo(4, cy); radarCtx.lineTo(cw - 4, cy);
   radarCtx.stroke();
 
-  // Avoidance route
+  // ── Avoidance route ────────────────────────────────────────────────────────
   const route = data.avoidance_route;
   if (data.obstacle_stop && route?.length >= 2) {
     radarCtx.save();
-    radarCtx.strokeStyle = '#fbbf24';
-    radarCtx.lineWidth = 2.5 * DPR;
-    radarCtx.setLineDash([7 * DPR, 4 * DPR]);
-    radarCtx.shadowColor = 'rgba(251,191,36,0.6)';
-    radarCtx.shadowBlur = 10;
-    radarCtx.beginPath();
-    radarCtx.moveTo(cx, cy);
+    radarCtx.strokeStyle = '#fbbf24'; radarCtx.lineWidth = 2.5; radarCtx.setLineDash([7, 4]);
+    radarCtx.shadowColor = 'rgba(251,191,36,0.6)'; radarCtx.shadowBlur = 10;
+    radarCtx.beginPath(); radarCtx.moveTo(cx, cy);
     route.forEach(wp => radarCtx.lineTo(cx - wp.y * scale, cy - wp.x * scale));
-    radarCtx.stroke();
-    radarCtx.setLineDash([]);
-    radarCtx.shadowBlur = 0;
+    radarCtx.stroke(); radarCtx.setLineDash([]); radarCtx.shadowBlur = 0;
     radarCtx.fillStyle = '#fbbf24';
     route.forEach((wp, i) => {
       const sx = cx - wp.y * scale, sy = cy - wp.x * scale;
-      radarCtx.beginPath();
-      radarCtx.arc(sx, sy, (i === route.length - 1 ? 5 : 3.5) * DPR, 0, Math.PI * 2);
-      radarCtx.fill();
+      radarCtx.beginPath(); radarCtx.arc(sx, sy, i === route.length - 1 ? 5 : 3.5, 0, Math.PI * 2); radarCtx.fill();
     });
     const side = route[0]?.side || (route[0]?.y > 0 ? 'left' : 'right');
-    radarCtx.font = `bold ${11 * DPR}px sans-serif`;
-    radarCtx.textAlign = 'center';
-    radarCtx.fillText(`DETOUR ${side.toUpperCase()}`, cx, 18 * DPR);
+    radarCtx.font = 'bold 10px sans-serif'; radarCtx.textAlign = 'center';
+    radarCtx.fillText(`DETOUR ${side.toUpperCase()}`, cx, 18);
     radarCtx.restore();
   }
 
-  // Scan points with gradient color
+  // ── Scan points ────────────────────────────────────────────────────────────
   if (data.points?.length) {
+    radarCtx.fillStyle = data.obstacle_stop ? '#f87171' : '#34d399';
     data.points.forEach(p => {
-      const dist = Math.hypot(p.x, p.y);
-      const sx = cx - p.y * scale;
-      const sy = cy - p.x * scale;
-      const isObs = data.obstacle_stop && Math.abs(Math.atan2(p.y, p.x)) < 0.4 && dist < 0.45;
-      const t = Math.min(1, dist / maxRange);
-      if (isObs) {
-        radarCtx.fillStyle = `rgba(248,113,113,${0.85 - t * 0.3})`;
-      } else {
-        const g = Math.round(180 + (1 - t) * 31);
-        const b = Math.round(80 + t * 73);
-        radarCtx.fillStyle = `rgba(52,${g},${b},${0.85 - t * 0.25})`;
-      }
-      const ptR = Math.max(1.5 * DPR, (1 - t * 0.5) * 2.5 * DPR);
-      radarCtx.fillRect(sx - ptR, sy - ptR, ptR * 2, ptR * 2);
+      const sx = cx - p.y * scale, sy = cy - p.x * scale;
+      radarCtx.fillRect(sx - 1.5, sy - 1.5, 3, 3);
     });
   }
 
-  // Obstacle stop-zone
+  // Obstacle stop-zone arc
   if (data.obstacle_stop) {
     radarCtx.save();
-    radarCtx.strokeStyle = 'rgba(248,113,113,0.55)';
-    radarCtx.lineWidth = 1.5 * DPR;
-    radarCtx.setLineDash([3 * DPR, 3 * DPR]);
+    radarCtx.strokeStyle = 'rgba(248,113,113,0.50)'; radarCtx.lineWidth = 1.5; radarCtx.setLineDash([3, 3]);
     const stopR = 0.35 * scale;
-    radarCtx.beginPath();
-    radarCtx.arc(cx, cy, stopR, -Math.PI * 0.75, -Math.PI * 0.25);
-    radarCtx.stroke();
+    radarCtx.beginPath(); radarCtx.arc(cx, cy, stopR, -Math.PI * 0.75, -Math.PI * 0.25); radarCtx.stroke();
     radarCtx.setLineDash([]);
-    radarCtx.fillStyle = '#f87171';
-    radarCtx.font = `bold ${9 * DPR}px sans-serif`;
-    radarCtx.textAlign = 'center';
-    radarCtx.fillText('BLOCKED', cx, cy - stopR - 5 * DPR);
+    radarCtx.fillStyle = '#f87171'; radarCtx.font = 'bold 9px sans-serif'; radarCtx.textAlign = 'center';
+    radarCtx.fillText('BLOCKED', cx, cy - stopR - 5);
     radarCtx.restore();
   }
 
-  // Rover footprint
-  const ROVER_L = 0.520, ROVER_W = 0.500, WHEEL_D = 0.120, WHEEL_TRK = 0.400, LIDAR_FWD = 0.240;
-  const hL = ROVER_L / 2 * scale, hW = ROVER_W / 2 * scale;
-  const wheelR = WHEEL_D / 2 * scale, wheelOff = WHEEL_TRK / 2 * scale;
+  // ── Rover physical footprint ───────────────────────────────────────────────
+  // Rover: 520 × 500 × 300 mm  |  Wheels: 120 mm dia, 400 mm track
+  // LiDAR: 240 mm forward of rover centre, laterally centred
+  //
+  // Radar screen convention (robot frame):
+  //   screen_x = cx − robot_y × scale   (left=+y → left on screen)
+  //   screen_y = cy − robot_x × scale   (fwd=+x  → up on screen)
+  const ROVER_L   = 0.520;    // m, front–back
+  const ROVER_W   = 0.500;    // m, left–right
+  const WHEEL_D   = 0.120;    // m, wheel diameter
+  const WHEEL_TRK = 0.400;    // m, wheel centre-to-centre
+  const LIDAR_FWD = 0.240;    // m, lidar forward offset from rover centre
+
+  const hL      = ROVER_L   / 2 * scale;    // half-length px
+  const hW      = ROVER_W   / 2 * scale;    // half-width  px
+  const wheelR  = WHEEL_D   / 2 * scale;    // wheel radius px
+  const wheelOff = WHEEL_TRK / 2 * scale;  // lateral offset px
 
   radarCtx.save();
-  const rBodyGrad = radarCtx.createLinearGradient(cx - hW, cy - hL, cx + hW, cy + hL);
-  rBodyGrad.addColorStop(0, 'rgba(56,189,248,0.10)');
-  rBodyGrad.addColorStop(1, 'rgba(56,189,248,0.04)');
-  radarCtx.fillStyle = rBodyGrad;
-  radarCtx.fillRect(cx - hW, cy - hL, hW * 2, hL * 2);
-  radarCtx.strokeStyle = 'rgba(56,189,248,0.55)';
-  radarCtx.lineWidth = 1.5 * DPR;
-  radarCtx.strokeRect(cx - hW, cy - hL, hW * 2, hL * 2);
-  radarCtx.strokeStyle = '#34d399';
-  radarCtx.lineWidth = 2.5 * DPR;
-  radarCtx.shadowColor = 'rgba(52,211,153,0.50)';
-  radarCtx.shadowBlur = 6;
-  radarCtx.beginPath();
-  radarCtx.moveTo(cx - hW, cy - hL);
-  radarCtx.lineTo(cx + hW, cy - hL);
-  radarCtx.stroke();
-  radarCtx.shadowBlur = 0;
 
+  // Body fill
+  radarCtx.fillStyle = 'rgba(56,189,248,0.07)';
+  radarCtx.fillRect(cx - hW, cy - hL, hW * 2, hL * 2);
+
+  // Body border
+  radarCtx.strokeStyle = 'rgba(56,189,248,0.48)';
+  radarCtx.lineWidth = 1.5;
+  radarCtx.strokeRect(cx - hW, cy - hL, hW * 2, hL * 2);
+
+  // Front edge — bright green
+  radarCtx.strokeStyle = '#34d399';
+  radarCtx.lineWidth = 2.5;
+  radarCtx.shadowColor = 'rgba(52,211,153,0.45)'; radarCtx.shadowBlur = 6;
+  radarCtx.beginPath();
+  radarCtx.moveTo(cx - hW, cy - hL); radarCtx.lineTo(cx + hW, cy - hL);
+  radarCtx.stroke(); radarCtx.shadowBlur = 0;
+
+  // Wheels (left = left on screen, right = right on screen)
   [['L', cx - wheelOff], ['R', cx + wheelOff]].forEach(([lbl, wx]) => {
-    radarCtx.fillStyle = 'rgba(100,116,139,0.22)';
-    radarCtx.strokeStyle = 'rgba(148,163,184,0.75)';
-    radarCtx.lineWidth = 1.5 * DPR;
-    radarCtx.beginPath();
-    radarCtx.arc(wx, cy, wheelR, 0, Math.PI * 2);
-    radarCtx.fill();
-    radarCtx.stroke();
-    radarCtx.fillStyle = 'rgba(148,163,184,0.60)';
-    radarCtx.font = `${6 * DPR}px sans-serif`;
-    radarCtx.textAlign = 'center';
-    radarCtx.fillText(lbl, wx, cy + 2 * DPR);
+    radarCtx.fillStyle   = 'rgba(100,116,139,0.22)';
+    radarCtx.strokeStyle = 'rgba(148,163,184,0.70)';
+    radarCtx.lineWidth   = 1.5;
+    radarCtx.beginPath(); radarCtx.arc(wx, cy, wheelR, 0, Math.PI * 2);
+    radarCtx.fill(); radarCtx.stroke();
+    // tiny label
+    radarCtx.fillStyle = 'rgba(148,163,184,0.55)';
+    radarCtx.font = '6px sans-serif'; radarCtx.textAlign = 'center';
+    radarCtx.fillText(lbl, wx, cy + 2);
+    // wheel diameter callout (once, left wheel)
+    if (lbl === 'L') {
+      radarCtx.fillStyle = 'rgba(100,116,139,0.55)';
+      radarCtx.font = '6px monospace'; radarCtx.textAlign = 'right';
+      radarCtx.fillText(`⌀${Math.round(WHEEL_D*100)}cm`, wx - wheelR - 2, cy - 2);
+    }
   });
 
-  radarCtx.strokeStyle = 'rgba(148,163,184,0.25)';
-  radarCtx.lineWidth = DPR;
-  radarCtx.setLineDash([2 * DPR, 3 * DPR]);
-  radarCtx.beginPath();
-  radarCtx.moveTo(cx - wheelOff, cy);
-  radarCtx.lineTo(cx + wheelOff, cy);
-  radarCtx.stroke();
-  radarCtx.setLineDash([]);
+  // Axle line
+  radarCtx.strokeStyle = 'rgba(148,163,184,0.25)'; radarCtx.lineWidth = 1;
+  radarCtx.setLineDash([2, 3]);
+  radarCtx.beginPath(); radarCtx.moveTo(cx - wheelOff, cy); radarCtx.lineTo(cx + wheelOff, cy);
+  radarCtx.stroke(); radarCtx.setLineDash([]);
 
+  // LiDAR position dot
   const lidarSY = cy - LIDAR_FWD * scale;
-  radarCtx.fillStyle = '#fbbf24';
-  radarCtx.shadowColor = '#fbbf24';
-  radarCtx.shadowBlur = 10;
-  radarCtx.beginPath();
-  radarCtx.arc(cx, lidarSY, 4 * DPR, 0, Math.PI * 2);
-  radarCtx.fill();
+  radarCtx.fillStyle = '#fbbf24'; radarCtx.shadowColor = '#fbbf24'; radarCtx.shadowBlur = 8;
+  radarCtx.beginPath(); radarCtx.arc(cx, lidarSY, 3.5, 0, Math.PI * 2); radarCtx.fill();
   radarCtx.shadowBlur = 0;
-  radarCtx.fillStyle = 'rgba(251,191,36,0.70)';
-  radarCtx.font = `${7 * DPR}px monospace`;
-  radarCtx.textAlign = 'left';
-  radarCtx.fillText('LiDAR', cx + 6 * DPR, lidarSY - 4 * DPR);
 
-  radarCtx.fillStyle = 'rgba(56,189,248,0.55)';
-  radarCtx.font = `${7 * DPR}px monospace`;
-  radarCtx.textAlign = 'center';
-  radarCtx.fillText(`◀${Math.round(ROVER_W * 100)}cm▶`, cx, cy + hL + 11 * DPR);
+  // LiDAR label
+  radarCtx.fillStyle = 'rgba(251,191,36,0.65)';
+  radarCtx.font = '6px monospace'; radarCtx.textAlign = 'left';
+  radarCtx.fillText('LiDAR', cx + 5, lidarSY - 4);
+
+  // Dimension callout — width
+  radarCtx.fillStyle = 'rgba(56,189,248,0.50)';
+  radarCtx.font = '7px monospace'; radarCtx.textAlign = 'center';
+  radarCtx.fillText(`◀${Math.round(ROVER_W*100)} cm▶`, cx, cy + hL + 10);
+
+  // Dimension callout — length
   radarCtx.textAlign = 'right';
-  radarCtx.fillText(`${Math.round(ROVER_L * 100)}cm`, cx - hW - 3 * DPR, cy);
-  radarCtx.fillStyle = '#34d399';
-  radarCtx.font = `bold ${7 * DPR}px sans-serif`;
-  radarCtx.textAlign = 'center';
-  radarCtx.fillText('▲ FRONT', cx, cy - hL - 6 * DPR);
+  radarCtx.fillText(`${Math.round(ROVER_L*100)}cm`, cx - hW - 3, cy);
+
+  // "FRONT" label
+  radarCtx.fillStyle = '#34d399'; radarCtx.font = 'bold 7px sans-serif'; radarCtx.textAlign = 'center';
+  radarCtx.fillText('▲ FRONT', cx, cy - hL - 5);
+
   radarCtx.restore();
 
-  radarCtx.fillStyle = '#38bdf8';
-  radarCtx.shadowColor = '#38bdf8';
-  radarCtx.shadowBlur = 8;
-  radarCtx.beginPath();
-  radarCtx.arc(cx, cy, 2.5 * DPR, 0, Math.PI * 2);
-  radarCtx.fill();
+  // Centre dot (rover origin)
+  radarCtx.fillStyle = '#38bdf8'; radarCtx.shadowColor = '#38bdf8'; radarCtx.shadowBlur = 8;
+  radarCtx.beginPath(); radarCtx.arc(cx, cy, 2.5, 0, Math.PI * 2); radarCtx.fill();
   radarCtx.shadowBlur = 0;
 
-  radarCtx.fillStyle = 'rgba(99,130,180,0.50)';
-  radarCtx.font = `${8 * DPR}px sans-serif`;
-  radarCtx.textAlign = 'left';
-  radarCtx.fillText('▲ FWD', cx - 12 * DPR, 11 * DPR);
-
   radarCtx.fillStyle = 'rgba(99,130,180,0.45)';
-  radarCtx.font = `${8 * DPR}px monospace`;
-  radarCtx.textAlign = 'right';
-  radarCtx.fillText(`${data.points?.length ?? 0} pts`, cw - 6 * DPR, ch - 6 * DPR);
+  radarCtx.font = '8px sans-serif'; radarCtx.textAlign = 'left';
+  radarCtx.fillText('▲ FWD', cx - 12, 10);
 }
 
 function drawScene(data) {
-  const { cw, ch } = _initCanvas(EL.sceneCanvas);
+  const cw = EL.sceneCanvas.width, ch = EL.sceneCanvas.height;
   const maxRange = data.max_range || 8.0;
   sceneCtx.clearRect(0, 0, cw, ch);
-
   const grad = sceneCtx.createLinearGradient(0, 0, 0, ch);
-  grad.addColorStop(0, '#0d1b2e');
-  grad.addColorStop(1, '#1a2a1a');
-  sceneCtx.fillStyle = grad;
-  sceneCtx.fillRect(0, 0, cw, ch);
-
+  grad.addColorStop(0, '#0d1b2e'); grad.addColorStop(1, '#1a2a1a');
+  sceneCtx.fillStyle = grad; sceneCtx.fillRect(0, 0, cw, ch);
   const horizon = ch * 0.55;
-  sceneCtx.strokeStyle = 'rgba(56,189,248,0.15)';
-  sceneCtx.lineWidth = DPR;
-  sceneCtx.beginPath();
-  sceneCtx.moveTo(0, horizon);
-  sceneCtx.lineTo(cw, horizon);
-  sceneCtx.stroke();
-
+  sceneCtx.strokeStyle = 'rgba(56,189,248,0.15)'; sceneCtx.lineWidth = 1;
+  sceneCtx.beginPath(); sceneCtx.moveTo(0, horizon); sceneCtx.lineTo(cw, horizon); sceneCtx.stroke();
   sceneCtx.strokeStyle = 'rgba(56,189,248,0.06)';
   for (let i = 0; i < 20; i++) {
     const y = horizon + (i / 20) * (ch - horizon);
-    sceneCtx.beginPath();
-    sceneCtx.moveTo(0, y);
-    sceneCtx.lineTo(cw, y);
-    sceneCtx.stroke();
+    sceneCtx.beginPath(); sceneCtx.moveTo(0, y); sceneCtx.lineTo(cw, y); sceneCtx.stroke();
   }
-
   if (data.points?.length) {
     data.points.forEach(p => {
       const dist = Math.hypot(p.x, p.y);
@@ -1672,35 +1227,28 @@ function drawScene(data) {
       const angle = Math.atan2(p.y, p.x);
       const normAngle = angle / (Math.PI / 2);
       const screenX = cw * (0.5 - normAngle * 0.55);
-      const relDist = dist / maxRange;
-      const screenY = horizon - (1 - relDist) * horizon * 0.9;
-      const dotSize = Math.max(1.5 * DPR, (1 - relDist) * 8 * DPR);
-      const isObs = data.obstacle_stop && Math.abs(angle) < 0.44 && dist < 0.45;
-      if (isObs) {
-        sceneCtx.fillStyle = '#f87171';
-      } else {
-        const g = Math.round(180 + (1 - relDist) * 31);
-        sceneCtx.fillStyle = `rgba(52,${g},153,${0.45 + relDist * 0.5})`;
-      }
-      sceneCtx.globalAlpha = 0.55 + relDist * 0.45;
-      sceneCtx.fillRect(screenX - dotSize / 2, screenY - dotSize / 2, dotSize, dotSize);
+      const relDist  = dist / maxRange;
+      const screenY  = horizon - (1 - relDist) * horizon * 0.9;
+      const dotSize  = Math.max(1.5, (1 - relDist) * 8);
+      const isObs    = data.obstacle_stop && Math.abs(angle) < 0.44 && dist < 0.45;
+      sceneCtx.fillStyle   = isObs ? '#f87171' : '#34d399';
+      sceneCtx.globalAlpha = 0.5 + relDist * 0.5;
+      sceneCtx.fillRect(screenX - dotSize/2, screenY - dotSize/2, dotSize, dotSize);
     });
     sceneCtx.globalAlpha = 1;
   }
-
   if (data.obstacle_stop && data.avoidance_route?.length) {
     const side = data.avoidance_route[0]?.side || (data.avoidance_route[0]?.y > 0 ? 'left' : 'right');
     const arrow = side === 'left' ? '← DETOUR LEFT' : 'DETOUR RIGHT →';
-    sceneCtx.fillStyle = '#fbbf24';
-    sceneCtx.font = `bold ${14 * DPR}px sans-serif`;
-    sceneCtx.globalAlpha = 0.90;
-    sceneCtx.textAlign = 'center';
-    sceneCtx.fillText(arrow, cw / 2, horizon - 20 * DPR);
+    sceneCtx.fillStyle = '#fbbf24'; sceneCtx.font = 'bold 14px sans-serif';
+    sceneCtx.globalAlpha = 0.90; sceneCtx.fillText(arrow, cw/2 - 64, horizon - 20);
     sceneCtx.globalAlpha = 1;
   }
 }
 
 // ── Poll loops (sequential debounce — no overlapping fetches) ─────────────────
+// v4 fix: each loop awaits the previous call before scheduling the next tick,
+// so a slow map payload render never blocks the faster status/lidar ticks.
 function seqLoop(fn, ms) {
   async function run() {
     try { await fn(); } catch (_) {}
@@ -1710,24 +1258,12 @@ function seqLoop(fn, ms) {
 }
 
 seqLoop(refreshStatus,       450);
-seqLoop(refreshMap,          300);   // v6: increased from 950ms to 300ms for responsive updates
+seqLoop(refreshMap,          300);   // Faster map updates for responsive display
 seqLoop(refreshLidar,        260);
 seqLoop(refreshCameraStatus, 2000);
 seqLoop(refreshPois,         5000);
 refreshMapList();
 setInterval(refreshMapList, 10000);
-
-// ── ResizeObserver for responsive canvas sizing ───────────────────────────────
-if (window.ResizeObserver) {
-  let _resizeTimer = null;
-  new ResizeObserver(() => {
-    clearTimeout(_resizeTimer);
-    _resizeTimer = setTimeout(() => {
-      if (STATE.mapMeta) drawMap(STATE.mapMeta);
-      _updateMapTransform();
-    }, 100);
-  }).observe(EL.mapOuter);
-}
 
 // Initialise map canvas cursor and tool hint
 setTool('goal');

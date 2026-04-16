@@ -42,12 +42,12 @@ from flask_socketio import SocketIO, emit
 
 from app import config
 from app.robot.camera import CameraManager
-from app.robot.control import RobotRuntime
+# ── Runtime settings must be initialised first — control.py → lidar.py
+#    import rtcfg at module level; init() must run before those imports. ──────
 from app.robot import runtime_cfg as _runtime_cfg_mod
-
-# Initialise runtime settings BEFORE RobotRuntime so rtcfg singleton is ready
 _runtime_cfg_mod.init(config.RUNTIME_SETTINGS_FILE)
-from app.robot.runtime_cfg import rtcfg  # noqa: E402 (after init)
+from app.robot.runtime_cfg import rtcfg          # now safe: singleton is live
+from app.robot.control import RobotRuntime
 
 logging.basicConfig(
     level=logging.INFO,

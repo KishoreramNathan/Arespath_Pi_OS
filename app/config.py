@@ -30,10 +30,11 @@ WHEEL_BASE_M   = 0.400        # centre-to-centre wheel track (matches WHEEL_TRAC
 #   Common gear ratios: 10:1, 20:1, 25:1, 30:1, 34:1, 50:1, 75:1
 #   ► Change MOTOR_GEAR_RATIO to match your specific motor variant.
 ENCODER_MODEL       = "OE-37"
-ENCODER_PPR         = 7       # pulses per motor revolution (OE-37 datasheet)
-ENCODER_QUADRATURE  = 4       # 4× quadrature decoding
-MOTOR_GEAR_RATIO    = 50.9     # ← set this to your gearbox ratio
+ENCODER_PPR         = 11       # pulses per motor revolution (OE-37 datasheet)
+ENCODER_QUADRATURE  = 4        # 4× quadrature decoding
+MOTOR_GEAR_RATIO    = 30.0     # ← set this to your gearbox ratio
 TICKS_PER_WHEEL_REV = float(ENCODER_PPR * ENCODER_QUADRATURE * MOTOR_GEAR_RATIO)
+# = 1320 counts/rev at 30:1  |  1496 at 34:1  |  3300 at 75:1
 
 # ── Drive limits ──────────────────────────────────────────────────────────────
 MAX_PWM = 180                  # maximum PWM value sent to Arduino
@@ -110,26 +111,26 @@ LIDAR_RENDER_MAX_POINTS = 360
 # 10,000 sq.ft ≈ 929 m².  At 0.05 m/cell → ~1858 cells/side to be safe.
 # We use 960 × 960 cells → 48 m × 48 m = 2304 m² ≈ 24,800 sq.ft (fits any
 # single-floor 10 k sq.ft building with plenty of margin).
-MAP_RESOLUTION_M = 0.05     # metres per cell
-MAP_SIZE_CELLS = 960        # grid is MAP_SIZE_CELLS × MAP_SIZE_CELLS (48 m × 48 m)
-MAP_ORIGIN_X_M = -24.0      # world X coordinate of cell (0,0)
-MAP_ORIGIN_Y_M = -24.0      # world Y coordinate of cell (0,0)
-FREE_HIT = -1.0             # log-odds decrement for free cells
-OCCUPIED_HIT = 3.0          # log-odds increment for occupied cells
+MAP_RESOLUTION_M = 0.025    # metres per cell (2.5cm = sharp walls, much clearer map)
+MAP_SIZE_CELLS = 960        # grid is MAP_SIZE_CELLS × MAP_SIZE_CELLS (24 m × 24 m)
+MAP_ORIGIN_X_M = -12.0      # world X coordinate of cell (0,0)
+MAP_ORIGIN_Y_M = -12.0      # world Y coordinate of cell (0,0)
+FREE_HIT = -0.5             # log-odds decrement for free cells (walls cleared less aggressively)
+OCCUPIED_HIT = 2.5          # log-odds increment for occupied cells
 LOG_ODDS_MIN = -5.0
 LOG_ODDS_MAX = 5.0
-MAP_OCCUPIED_THRESHOLD = 0.65
-MAP_FREE_THRESHOLD = 0.35
-PLANNER_INFLATION_CELLS = 3  # obstacle inflation radius for A* (slightly wider for larger map)
+MAP_OCCUPIED_THRESHOLD = 0.65  # Only definitely occupied cells marked as walls
+MAP_FREE_THRESHOLD = 0.28       # Cells need strong evidence to be marked free
+PLANNER_INFLATION_CELLS = 3     # obstacle inflation radius for A*
 
 # ── LiDAR-based localization (scan-matching ICP) ──────────────────────────────
 LIDAR_LOCALIZATION_ENABLED = True   # set False to fall back to pure odometry
-LIDAR_ICP_MAX_ITERATIONS   = 20     # ICP convergence iterations
-LIDAR_ICP_TOLERANCE_M      = 0.005  # ICP convergence threshold (metres)
-LIDAR_ICP_MAX_CORRESP_M    = 0.30   # max point correspondence distance
-LIDAR_ICP_WEIGHT           = 0.55   # blend weight: 1.0 = full ICP, 0.0 = full odom
-LIDAR_ICP_MIN_POINTS       = 30     # skip ICP if scan has fewer than this many points
-LIDAR_ICP_INTERVAL_S       = 0.15   # run ICP at most this often (seconds)
+LIDAR_ICP_MAX_ITERATIONS   = 30     # More iterations for better convergence
+LIDAR_ICP_TOLERANCE_M      = 0.002  # Stricter tolerance for accuracy
+LIDAR_ICP_MAX_CORRESP_M    = 0.50   # Wider correspondence search radius
+LIDAR_ICP_WEIGHT           = 0.70   # Higher weight = trust ICP more, correct drift faster
+LIDAR_ICP_MIN_POINTS       = 20     # Skip ICP if scan has fewer points
+LIDAR_ICP_INTERVAL_S       = 0.10   # Run ICP more frequently (100ms)
 
 # ── POI / Waypoint features ───────────────────────────────────────────────────
 POIS_FILE             = DATA_DIR / "pois.json"              # persistent store for points of interest
@@ -138,5 +139,5 @@ RUNTIME_SETTINGS_FILE = DATA_DIR / "runtime_settings.json"  # live-tunable param
 # ── Web server ────────────────────────────────────────────────────────────────
 WEB_PORT = 8080
 STATUS_POLL_MS = 450
-MAP_POLL_MS = 900
+MAP_POLL_MS = 400
 LIDAR_POLL_MS = 260

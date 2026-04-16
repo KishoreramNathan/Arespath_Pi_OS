@@ -163,7 +163,6 @@ class LidarManager:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import numpy as np  # noqa: E402  (already imported above via math/time)
-from app.robot.runtime_cfg import rtcfg
 
 
 class LidarLocalizer:
@@ -214,7 +213,7 @@ class LidarLocalizer:
         self._ref_cloud = pts   # update reference to current scan
         self._last_run = now
 
-        w = rtcfg.get("lidar_icp_weight")
+        w = __import__('app.robot.runtime_cfg', fromlist=['rtcfg']).rtcfg.get("lidar_icp_weight")
         corrected = Pose(
             x     = pose.x     + w * dx,
             y     = pose.y     + w * dy,
