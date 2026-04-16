@@ -193,7 +193,6 @@ class OccupancyGridMap:
             thumb.save(buf, format="PNG", optimize=False)
             self._png_cache = base64.b64encode(buf.getvalue()).decode("ascii")
             self._png_cache_time = now
-            self._thumb_size = thumb_size
 
         scale = self.size / thumb_size  # grid to thumbnail scale
 

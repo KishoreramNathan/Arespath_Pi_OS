@@ -782,8 +782,10 @@ function _clearObstacleCountdown() {
 }
 
 async function refreshStatus() {
-  try { applyStatus(await api('/api/status')); }
-  catch (e) { setText('st-connected', 'ERROR'); setText('st-error', e.message); }
+  try {
+    const s = await api('/api/status');
+    if (s) applyStatus(s);
+  } catch (e) { setText('st-connected', 'ERR'); setText('st-error', e.message || 'Connection error'); }
 }
 
 // ── Map list ──────────────────────────────────────────────────────────────────
@@ -803,12 +805,16 @@ async function refreshMapList() {
 }
 
 // ── Map canvas render ─────────────────────────────────────────────────────────
+let _lastCanvasSize = { w: 0, h: 0 };
+
 function _fitCanvas() {
   const outer = EL.mapOuter;
   if (!outer) return;
   const w = outer.clientWidth  || 800;
   const h = outer.clientHeight || 800;
   const dpr = window.devicePixelRatio || 1;
+  if (w === _lastCanvasSize.w && h === _lastCanvasSize.h) return;
+  _lastCanvasSize = { w, h };
   EL.mapCanvas.width  = Math.floor(w * dpr);
   EL.mapCanvas.height = Math.floor(h * dpr);
   EL.mapCanvas.style.width  = w + 'px';
@@ -816,11 +822,29 @@ function _fitCanvas() {
 }
 
 let _lastMapPayloadHash = '';
+let _lastMapData = null;
 
 async function refreshMap() {
-  _fitCanvas();
   try {
     const meta = await api('/api/map/data');
+    if (!meta || !meta.resolution || !meta.width) return;
+    
+    const payloadHash = (meta.image_png_b64 || '').slice(-32);
+    const mapChanged = payloadHash !== _lastMapPayloadHash;
+    _lastMapPayloadHash = payloadHash;
+
+    const needsRedraw = mapChanged || !_lastMapData || 
+      STATE.mapPanX !== _lastMapData.panX || 
+      STATE.mapPanY !== _lastMapData.panY ||
+      STATE.mapZoom !== _lastMapData.zoom ||
+      STATE.pendingGoal !== _lastMapData.pendingGoal ||
+      JSON.stringify(meta.pose) !== JSON.stringify(_lastMapData.pose) ||
+      JSON.stringify(meta.path) !== JSON.stringify(_lastMapData.path) ||
+      JSON.stringify(meta.goal) !== JSON.stringify(_lastMapData.goal);
+
+    if (!needsRedraw) return;
+
+    _fitCanvas();
     STATE.mapMeta = meta;
 
     if (!STATE.mapCentered && meta.pose) {
@@ -833,15 +857,22 @@ async function refreshMap() {
       STATE.mapCentered = true;
     }
 
-    const payloadHash = (meta.image_png_b64 || '').slice(-32);
-    const needsFullRedraw = payloadHash !== _lastMapPayloadHash;
-    _lastMapPayloadHash = payloadHash;
+    _lastMapData = {
+      panX: STATE.mapPanX,
+      panY: STATE.mapPanY,
+      zoom: STATE.mapZoom,
+      pendingGoal: STATE.pendingGoal,
+      pose: meta.pose,
+      path: meta.path,
+      goal: meta.goal
+    };
 
-    drawMap(meta, needsFullRedraw);
+    drawMap(meta, mapChanged);
   } catch (_) {}
 }
 
-async function drawMap(meta, needsFullRedraw = true) {
+async function drawMap(meta, mapImageChanged = true) {
+  if (!meta || !meta.resolution || !meta.width) return;
   const dpr = window.devicePixelRatio || 1;
   const cw  = EL.mapCanvas.width  / dpr;
   const ch  = EL.mapCanvas.height / dpr;
@@ -850,14 +881,13 @@ async function drawMap(meta, needsFullRedraw = true) {
   const panY = STATE.mapPanY / dpr;
 
   mapCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  mapCtx.clearRect(0, 0, cw, ch);
-  mapCtx.fillStyle = '#0a0f1e';
-  mapCtx.fillRect(0, 0, cw, ch);
 
-  if (needsFullRedraw && meta.image_png_b64) {
+  if (mapImageChanged && meta.image_png_b64) {
+    mapCtx.clearRect(0, 0, cw, ch);
     const img = new Image();
     await new Promise(res => { img.onload = res; img.src = 'data:image/png;base64,' + meta.image_png_b64; });
     STATE._mapImg = img;
+    mapCtx.drawImage(img, 0, 0, cw, ch);
   }
 
   mapCtx.save();
@@ -867,13 +897,6 @@ async function drawMap(meta, needsFullRedraw = true) {
   mapCtx.beginPath();
   mapCtx.rect(panX, panY, cw / z, ch / z);
   mapCtx.clip();
-
-  if (meta.image_png_b64 && STATE._mapImg) {
-    mapCtx.drawImage(STATE._mapImg, 0, 0);
-  } else {
-    mapCtx.fillStyle = '#0a0f1e';
-    mapCtx.fillRect(0, 0, meta.width, meta.height);
-  }
 
   const toC = p => ({
     x: p.x * z + panX,
@@ -1003,101 +1026,6 @@ async function drawMap(meta, needsFullRedraw = true) {
   mapCtx.restore();
 }
 
-  if (STATE.pendingGoal && STATE.mapMeta) {
-    const res = meta.resolution || 0.02;
-    const ox = meta.origin[0], oy = meta.origin[1];
-    const gx = (STATE.pendingGoal.x - ox) / res;
-    const gy = (STATE.pendingGoal.y - oy) / res;
-    const c = toC({ x: gx, y: gy });
-    mapCtx.save();
-    mapCtx.strokeStyle = '#60a5fa'; mapCtx.lineWidth = 1.5 / z;
-    mapCtx.setLineDash([3 / z, 2 / z]);
-    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 3 / z, 0, Math.PI * 2); mapCtx.stroke();
-    mapCtx.setLineDash([]);
-    mapCtx.beginPath();
-    mapCtx.moveTo(c.x, c.y - 8 / z); mapCtx.lineTo(c.x, c.y + 8 / z);
-    mapCtx.moveTo(c.x - 8 / z, c.y); mapCtx.lineTo(c.x + 8 / z, c.y);
-    mapCtx.stroke(); mapCtx.restore();
-  }
-
-  if (meta.goal) {
-    const c = toC(meta.goal);
-    mapCtx.save();
-    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 2 / z;
-    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 6 / z;
-    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 3.5 / z, 0, Math.PI * 2); mapCtx.stroke();
-    mapCtx.beginPath();
-    mapCtx.moveTo(c.x, c.y - 10 / z); mapCtx.lineTo(c.x, c.y + 10 / z);
-    mapCtx.moveTo(c.x - 10 / z, c.y); mapCtx.lineTo(c.x + 10 / z, c.y);
-    mapCtx.stroke(); mapCtx.restore();
-  }
-
-  const pois = meta.pois || [];
-  pois.forEach(poi => {
-    const c = toC({ x: poi.px, y: poi.py });
-    const r = 8 / z;
-    mapCtx.save();
-    mapCtx.fillStyle = 'rgba(251,191,36,0.2)';
-    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, r * 1.6, 0, Math.PI*2); mapCtx.fill();
-    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 1.5 / z;
-    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 4 / z;
-    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, r, 0, Math.PI*2); mapCtx.stroke();
-    mapCtx.restore();
-    mapCtx.save();
-    mapCtx.font = `${11 / z}px sans-serif`;
-    mapCtx.textAlign = 'center'; mapCtx.textBaseline = 'top';
-    mapCtx.fillStyle = '#fbbf24';
-    mapCtx.shadowColor = '#000'; mapCtx.shadowBlur = 2 / z;
-    mapCtx.fillText(poi.label, c.x, c.y + r + 1 / z);
-    mapCtx.restore();
-  });
-
-  if (meta.pose) {
-    const c   = toC(meta.pose);
-    const th  = meta.pose.theta;
-    const ppm = 1 / meta.resolution;
-    const rL  = 0.520 / 2 * ppm;
-    const rW  = 0.500 / 2 * ppm;
-    mapCtx.save();
-    mapCtx.translate(c.x, c.y);
-    mapCtx.rotate(th);
-    mapCtx.fillStyle = 'rgba(56,189,248,0.15)';
-    mapCtx.fillRect(-rW, -rL, rW * 2, rL * 2);
-    mapCtx.strokeStyle = 'rgba(56,189,248,0.6)'; mapCtx.lineWidth = 1.5 / z;
-    mapCtx.strokeRect(-rW, -rL, rW * 2, rL * 2);
-    mapCtx.strokeStyle = '#34d399'; mapCtx.lineWidth = 2.5 / z;
-    mapCtx.shadowColor = 'rgba(52,211,153,0.6)'; mapCtx.shadowBlur = 6 / z;
-    mapCtx.beginPath(); mapCtx.moveTo(-rW, rL); mapCtx.lineTo(rW, rL); mapCtx.stroke();
-    mapCtx.shadowBlur = 0;
-    mapCtx.fillStyle = '#38bdf8';
-    mapCtx.shadowColor = 'rgba(56,189,248,0.6)'; mapCtx.shadowBlur = 8 / z;
-    const ar = Math.max(3 / z, rL * 0.5);
-    mapCtx.beginPath();
-    mapCtx.moveTo(0, rL - ar * 0.2); mapCtx.lineTo(-ar * 0.5, rL - ar); mapCtx.lineTo(ar * 0.5, rL - ar);
-    mapCtx.closePath(); mapCtx.fill();
-    mapCtx.restore();
-  }
-
-  mapCtx.restore();
-
-  const vw = cw / z, vh = ch / z;
-  const pixelsPerM_screen = vw / (meta.width * meta.resolution);
-  const bar1m_s = pixelsPerM_screen;
-  mapCtx.save();
-  mapCtx.fillStyle = 'rgba(255,255,255,0.85)';
-  mapCtx.fillRect(12, ch - 22, bar1m_s, 3);
-  mapCtx.font = '8px monospace'; mapCtx.textAlign = 'left'; mapCtx.fillStyle = 'rgba(255,255,255,0.75)';
-  mapCtx.fillText('1 m', 12 + bar1m_s + 3, ch - 18);
-  const bar5m_s = 5 * pixelsPerM_screen;
-  mapCtx.fillStyle = 'rgba(56,189,248,0.55)';
-  mapCtx.fillRect(12, ch - 12, bar5m_s, 3);
-  mapCtx.fillStyle = 'rgba(56,189,248,0.7)';
-  mapCtx.fillText('5 m', 12 + bar5m_s + 3, ch - 10);
-  mapCtx.textAlign = 'right'; mapCtx.fillStyle = 'rgba(99,130,180,0.5)';
-  mapCtx.fillText(`${(meta.resolution * 100)|0} cm/px`, cw - 6, ch - 6);
-  mapCtx.restore();
-}
-
 // ── Lidar render ──────────────────────────────────────────────────────────────
 async function refreshLidar() {
   try {
@@ -1110,6 +1038,7 @@ async function refreshLidar() {
 }
 
 function drawRadar(data) {
+  if (!data || !EL.radarCanvas) return;
   const cw = EL.radarCanvas.width, ch = EL.radarCanvas.height;
   const cx = cw / 2, cy = ch / 2;
   const maxRange = data.max_range || 8.0;
@@ -1312,6 +1241,7 @@ function drawRadar(data) {
 }
 
 function drawScene(data) {
+  if (!data || !EL.sceneCanvas) return;
   const cw = EL.sceneCanvas.width, ch = EL.sceneCanvas.height;
   const maxRange = data.max_range || 8.0;
   sceneCtx.clearRect(0, 0, cw, ch);
