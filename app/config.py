@@ -108,29 +108,28 @@ LIDAR_MAX_RANGE_M = 8.0
 LIDAR_RENDER_MAX_POINTS = 360
 
 # ── Occupancy map ─────────────────────────────────────────────────────────────
-# 10,000 sq.ft ≈ 929 m².  At 0.05 m/cell → ~1858 cells/side to be safe.
-# We use 960 × 960 cells → 48 m × 48 m = 2304 m² ≈ 24,800 sq.ft (fits any
-# single-floor 10 k sq.ft building with plenty of margin).
-MAP_RESOLUTION_M = 0.025    # metres per cell (2.5cm = sharp walls, much clearer map)
-MAP_SIZE_CELLS = 960        # grid is MAP_SIZE_CELLS × MAP_SIZE_CELLS (24 m × 24 m)
-MAP_ORIGIN_X_M = -12.0      # world X coordinate of cell (0,0)
-MAP_ORIGIN_Y_M = -12.0      # world Y coordinate of cell (0,0)
-FREE_HIT = -0.5             # log-odds decrement for free cells (walls cleared less aggressively)
-OCCUPIED_HIT = 2.5          # log-odds increment for occupied cells
+# 10,000 sq.ft ≈ 929 m².  At 0.02 m/cell (2cm) → high detail mapping.
+# We use 2400 × 2400 cells → 48 m × 48 m = 2304 m² ≈ 24,800 sq.ft.
+MAP_RESOLUTION_M = 0.02     # metres per cell (2cm for high detail)
+MAP_SIZE_CELLS = 2400       # grid is MAP_SIZE_CELLS × MAP_SIZE_CELLS (48 m × 48 m)
+MAP_ORIGIN_X_M = -24.0      # world X coordinate of cell (0,0)
+MAP_ORIGIN_Y_M = -24.0      # world Y coordinate of cell (0,0)
+FREE_HIT = -0.5             # log-odds decrement for free cells (moderate stability)
+OCCUPIED_HIT = 2.0          # log-odds increment for occupied cells
 LOG_ODDS_MIN = -5.0
 LOG_ODDS_MAX = 5.0
-MAP_OCCUPIED_THRESHOLD = 0.65  # Only definitely occupied cells marked as walls
-MAP_FREE_THRESHOLD = 0.28       # Cells need strong evidence to be marked free
-PLANNER_INFLATION_CELLS = 3     # obstacle inflation radius for A*
+MAP_OCCUPIED_THRESHOLD = 0.68  # Occupied threshold (higher = fewer false walls)
+MAP_FREE_THRESHOLD = 0.32      # Free threshold (lower = more stable free space)
+PLANNER_INFLATION_CELLS = 5    # obstacle inflation radius for A* (cells)
 
 # ── LiDAR-based localization (scan-matching ICP) ──────────────────────────────
 LIDAR_LOCALIZATION_ENABLED = True   # set False to fall back to pure odometry
-LIDAR_ICP_MAX_ITERATIONS   = 30     # More iterations for better convergence
-LIDAR_ICP_TOLERANCE_M      = 0.002  # Stricter tolerance for accuracy
-LIDAR_ICP_MAX_CORRESP_M    = 0.50   # Wider correspondence search radius
-LIDAR_ICP_WEIGHT           = 0.70   # Higher weight = trust ICP more, correct drift faster
-LIDAR_ICP_MIN_POINTS       = 20     # Skip ICP if scan has fewer points
-LIDAR_ICP_INTERVAL_S       = 0.10   # Run ICP more frequently (100ms)
+LIDAR_ICP_MAX_ITERATIONS   = 50     # More iterations for better convergence
+LIDAR_ICP_TOLERANCE_M      = 0.001  # Very strict tolerance for accuracy
+LIDAR_ICP_MAX_CORRESP_M    = 0.40   # Correspondence search radius (meters)
+LIDAR_ICP_WEIGHT           = 0.80   # Trust ICP heavily for drift correction
+LIDAR_ICP_MIN_POINTS       = 15     # Skip ICP if scan has fewer points
+LIDAR_ICP_INTERVAL_S       = 0.05   # Run ICP at 20Hz for smooth tracking while moving
 
 # ── POI / Waypoint features ───────────────────────────────────────────────────
 POIS_FILE             = DATA_DIR / "pois.json"              # persistent store for points of interest
@@ -139,5 +138,5 @@ RUNTIME_SETTINGS_FILE = DATA_DIR / "runtime_settings.json"  # live-tunable param
 # ── Web server ────────────────────────────────────────────────────────────────
 WEB_PORT = 8080
 STATUS_POLL_MS = 450
-MAP_POLL_MS = 400
+MAP_POLL_MS = 900
 LIDAR_POLL_MS = 260

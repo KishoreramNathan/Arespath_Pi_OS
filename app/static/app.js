@@ -36,6 +36,7 @@ const STATE = {
   pendingPoi:  null,   // {x, y} world coords awaiting form submit
   // Goal pending placement (placed on map, not yet sent to backend)
   pendingGoal: null,   // {x, y} world coords
+  mapCentered: false,  // auto-center on rover
 };
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
@@ -108,56 +109,6 @@ const EL = {
 const mapCtx   = EL.mapCanvas.getContext('2d');
 const radarCtx = EL.radarCanvas.getContext('2d');
 const sceneCtx = EL.sceneCanvas.getContext('2d');
-
-// ── HiDPI canvas setup ───────────────────────────────────────────────────────
-// Use devicePixelRatio so the canvas renders at native resolution on Retina/HiDPI screens
-const DPR = window.devicePixelRatio || 1;
-function setupHiDPICanvas(canvas, cssW, cssH) {
-  canvas.width  = cssW * DPR;
-  canvas.height = cssH * DPR;
-  const ctx = canvas.getContext('2d');
-  ctx.scale(DPR, DPR);
-  canvas.style.width  = cssW + 'px';
-  canvas.style.height = cssH + 'px';
-  return ctx;
-}
-
-// Map canvas: 820px CSS wide, full HiDPI support
-const MAP_CSS_W = 820;
-const MAP_CSS_H = 820;
-setupHiDPICanvas(EL.mapCanvas, MAP_CSS_W, MAP_CSS_H);
-
-// Map viewport state — world coordinates of the visible viewport centre
-const VIEW = {
-  zoom:    1.0,      // pixels per world-metre
-  centerX: 0.0,      // world X of canvas centre
-  centerY: 0.0,      // world Y of canvas centre
-};
-
-// ── Coordinate conversion ─────────────────────────────────────────────────────
-// World (metres) ↔ Canvas pixels (CSS pixels, accounting for DPR)
-function worldToCanvas(wx, wy) {
-  return {
-    x: (wx - VIEW.centerX) * VIEW.zoom + MAP_CSS_W / 2,
-    y: (wy - VIEW.centerY) * VIEW.zoom + MAP_CSS_H / 2,
-  };
-}
-
-function canvasToWorld(cx, cy) {
-  return {
-    x: (cx - MAP_CSS_W / 2) / VIEW.zoom + VIEW.centerX,
-    y: (cy - MAP_CSS_H / 2) / VIEW.zoom + VIEW.centerY,
-  };
-}
-
-// Convert pointer event to canvas-relative CSS pixels
-function eventToCanvasPx(e) {
-  const rect = EL.mapCanvas.getBoundingClientRect();
-  return {
-    x: e.clientX - rect.left,
-    y: e.clientY - rect.top,
-  };
-}
 
 // ── REST helper ───────────────────────────────────────────────────────────────
 async function api(path, method = 'GET', body = null) {
@@ -337,7 +288,7 @@ function setTool(tool) {
 // ── Map controls ──────────────────────────────────────────────────────────────
 EL.mapStartBtn .addEventListener('click', () => api('/api/map/start', 'POST', { clear: false }).catch(() => {}));
 EL.mapStopBtn  .addEventListener('click', () => api('/api/map/stop',  'POST', {}).catch(() => {}));
-EL.mapResetBtn .addEventListener('click', () => api('/api/map/reset', 'POST', {}).catch(() => {}));
+EL.mapResetBtn .addEventListener('click', () => { api('/api/map/reset', 'POST', {}).catch(() => {}); STATE.mapCentered = false; STATE.pendingGoal = null; });
 EL.saveMapBtn  .addEventListener('click', () =>
   api('/api/map/save', 'POST', { name: EL.mapName.value || 'map' }).then(refreshMapList).catch(() => {}));
 EL.loadMapBtn  .addEventListener('click', () => {
@@ -351,30 +302,40 @@ EL.startMissionBtn.addEventListener('click', () => {
 EL.cancelNavBtn.addEventListener('click', () => { api('/api/navigate/cancel', 'POST', {}).catch(() => {}); STATE.pendingGoal = null; });
 
 // ── Map zoom / pan buttons ────────────────────────────────────────────────────
-EL.mapZoomInBtn   .addEventListener('click', () => applyZoom(1.25));
-EL.mapZoomOutBtn  .addEventListener('click', () => applyZoom(0.80));
-EL.mapZoomResetBtn.addEventListener('click', () => { STATE.mapZoom = 1; STATE.mapPanX = 0; STATE.mapPanY = 0; _updateMapTransform(); });
+EL.mapZoomInBtn   .addEventListener('click', () => applyZoom(1.15, null));
+EL.mapZoomOutBtn  .addEventListener('click', () => applyZoom(0.87, null));
+EL.mapZoomResetBtn.addEventListener('click', () => {
+  STATE.mapZoom = 1;
+  STATE.mapPanX = 0; STATE.mapPanY = 0;
+  if (EL.zoomLevel) EL.zoomLevel.textContent = '1.0×';
+});
 
-function applyZoom(factor) {
-  const cw = EL.mapCanvas.width, ch = EL.mapCanvas.height;
-  STATE.mapZoom = Math.max(0.25, Math.min(8, STATE.mapZoom * factor));
-  _updateMapTransform();
-}
+function applyZoom(factor, clientX, clientY) {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = EL.mapCanvas.width / dpr, ch = EL.mapCanvas.height / dpr;
+  const rect = EL.mapCanvas.getBoundingClientRect();
 
-function _updateMapTransform() {
-  const z = STATE.mapZoom;
-  const cw = EL.mapCanvas.width, ch = EL.mapCanvas.height;
-  const ox = (cw * (1 - z)) / 2 + STATE.mapPanX;
-  const oy = (ch * (1 - z)) / 2 + STATE.mapPanY;
-  EL.mapCanvas.style.transform       = `translate(${ox}px, ${oy}px) scale(${z})`;
-  EL.mapCanvas.style.transformOrigin = '50% 50%';
-  if (EL.zoomLevel) EL.zoomLevel.textContent = `${z.toFixed(1)}×`;
+  let mx = cw / 2, my = ch / 2;
+  if (clientX !== null && clientY !== null) {
+    mx = clientX - rect.left;
+    my = clientY - rect.top;
+  }
+
+  const worldX = (mx - STATE.mapPanX / dpr) / STATE.mapZoom;
+  const worldY = (my - STATE.mapPanY / dpr) / STATE.mapZoom;
+
+  STATE.mapZoom = Math.max(0.3, Math.min(12, STATE.mapZoom * factor));
+
+  STATE.mapPanX = (worldX * STATE.mapZoom - mx) * dpr;
+  STATE.mapPanY = (worldY * STATE.mapZoom - my) * dpr;
+
+  if (EL.zoomLevel) EL.zoomLevel.textContent = `${STATE.mapZoom.toFixed(1)}×`;
 }
 
 // ── Scroll-wheel zoom ─────────────────────────────────────────────────────────
 EL.mapOuter && EL.mapOuter.addEventListener('wheel', e => {
   e.preventDefault();
-  applyZoom(e.deltaY < 0 ? 1.12 : 0.89);
+  applyZoom(e.deltaY < 0 ? 1.10 : 0.91, e.clientX, e.clientY);
 }, { passive: false });
 
 // ── Pan gestures on map canvas ────────────────────────────────────────────────
@@ -392,12 +353,10 @@ EL.mapCanvas.addEventListener('pointerdown', e => {
 
 EL.mapCanvas.addEventListener('pointermove', e => {
   if (STATE.mapTool === 'pan' && STATE.mapDragging && STATE.mapDragLast) {
-    const dx = e.clientX - STATE.mapDragLast.x;
-    const dy = e.clientY - STATE.mapDragLast.y;
-    STATE.mapPanX += dx;
-    STATE.mapPanY += dy;
+    const dpr = window.devicePixelRatio || 1;
+    STATE.mapPanX += (e.clientX - STATE.mapDragLast.x) * dpr;
+    STATE.mapPanY += (e.clientY - STATE.mapDragLast.y) * dpr;
     STATE.mapDragLast = { x: e.clientX, y: e.clientY };
-    _updateMapTransform();
     return;
   }
   if (!STATE.dragStart || !STATE.mapMeta || STATE.mapTool !== 'start') return;
@@ -430,15 +389,15 @@ EL.mapCanvas.addEventListener('pointercancel', () => {
 });
 
 function canvasToWorld(e, meta) {
+  const dpr = window.devicePixelRatio || 1;
   const rect = EL.mapCanvas.getBoundingClientRect();
-  // Account for zoom/pan — getBoundingClientRect gives display coords
-  const scaleX = EL.mapCanvas.width  / rect.width;
-  const scaleY = EL.mapCanvas.height / rect.height;
-  const cx = Math.round((e.clientX - rect.left) * scaleX);
-  const cy = Math.round((e.clientY - rect.top)  * scaleY);
+  const cx = (e.clientX - rect.left) * dpr;
+  const cy = (e.clientY - rect.top)  * dpr;
+  const worldX = (cx - STATE.mapPanX) / STATE.mapZoom;
+  const worldY = (cy - STATE.mapPanY) / STATE.mapZoom;
   return {
-    x: cx * meta.resolution + meta.origin[0],
-    y: cy * meta.resolution + meta.origin[1],
+    x: worldX * meta.resolution + meta.origin[0],
+    y: worldY * meta.resolution + meta.origin[1],
   };
 }
 
@@ -842,169 +801,321 @@ async function refreshMapList() {
 }
 
 // ── Map canvas render ─────────────────────────────────────────────────────────
+function _fitCanvas() {
+  const outer = EL.mapOuter;
+  if (!outer) return;
+  const w = outer.clientWidth  || 800;
+  const h = outer.clientHeight || 800;
+  const dpr = window.devicePixelRatio || 1;
+  EL.mapCanvas.width  = Math.floor(w * dpr);
+  EL.mapCanvas.height = Math.floor(h * dpr);
+  EL.mapCanvas.style.width  = w + 'px';
+  EL.mapCanvas.style.height = h + 'px';
+}
+
 async function refreshMap() {
+  _fitCanvas();
   try {
     const meta = await api('/api/map/data');
     STATE.mapMeta = meta;
+
+    if (!STATE.mapCentered && meta.pose) {
+      const dpr = window.devicePixelRatio || 1;
+      const cw = EL.mapCanvas.width / dpr, ch = EL.mapCanvas.height / dpr;
+      const z = STATE.mapZoom;
+      const visibleW = cw / z, visibleH = ch / z;
+      STATE.mapPanX = (meta.pose.x - visibleW / 2) * dpr;
+      STATE.mapPanY = (meta.pose.y - visibleH / 2) * dpr;
+      STATE.mapCentered = true;
+    }
+
     drawMap(meta);
   } catch (_) {}
 }
 
 async function drawMap(meta) {
-  const cw = EL.mapCanvas.width, ch = EL.mapCanvas.height;
+  const dpr = window.devicePixelRatio || 1;
+  const cw  = EL.mapCanvas.width  / dpr;
+  const ch  = EL.mapCanvas.height / dpr;
+  const z   = STATE.mapZoom;
+  const panX = STATE.mapPanX / dpr;
+  const panY = STATE.mapPanY / dpr;
+
+  mapCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
   mapCtx.clearRect(0, 0, cw, ch);
-  mapCtx.fillStyle = '#1a2236';
+  mapCtx.fillStyle = '#0a0f1e';
   mapCtx.fillRect(0, 0, cw, ch);
+
+  mapCtx.save();
+  mapCtx.scale(z, z);
+  mapCtx.translate(-panX, -panY);
+
+  mapCtx.beginPath();
+  mapCtx.rect(panX, panY, cw / z, ch / z);
+  mapCtx.clip();
 
   if (meta.image_png_b64) {
     const img = new Image();
     await new Promise(res => { img.onload = res; img.src = 'data:image/png;base64,' + meta.image_png_b64; });
-    mapCtx.drawImage(img, 0, 0, cw, ch);
+    mapCtx.drawImage(img, 0, 0);
+  } else {
+    mapCtx.fillStyle = '#0a0f1e';
+    mapCtx.fillRect(0, 0, meta.width, meta.height);
   }
 
-  const toC = p => ({ x: (p.x / meta.width) * cw, y: (p.y / meta.height) * ch });
+  const toC = p => ({ x: p.x * z + panX, y: p.y * z + panY });
 
-  // Grid (every 1 m = 20 cells at 0.05 m/cell)
-  const step = Math.max(10, Math.round(1.0 / meta.resolution));
-  mapCtx.save();
-  mapCtx.strokeStyle = 'rgba(255,255,255,0.04)'; mapCtx.lineWidth = 1;
+  const step = Math.max(5, Math.round(1.0 / meta.resolution));
+  mapCtx.strokeStyle = 'rgba(255,255,255,0.05)'; mapCtx.lineWidth = 1 / z;
   for (let x = 0; x <= meta.width; x += step) {
-    const px = (x / meta.width) * cw;
-    mapCtx.beginPath(); mapCtx.moveTo(px, 0); mapCtx.lineTo(px, ch); mapCtx.stroke();
+    mapCtx.beginPath(); mapCtx.moveTo(x, 0); mapCtx.lineTo(x, meta.height); mapCtx.stroke();
   }
   for (let y = 0; y <= meta.height; y += step) {
-    const py = (y / meta.height) * ch;
-    mapCtx.beginPath(); mapCtx.moveTo(0, py); mapCtx.lineTo(cw, py); mapCtx.stroke();
+    mapCtx.beginPath(); mapCtx.moveTo(0, y); mapCtx.lineTo(meta.width, y); mapCtx.stroke();
+  }
+
+  if (meta.scan?.length) {
+    mapCtx.fillStyle = 'rgba(52,211,153,0.7)';
+    const dot = 1.5 / z;
+    meta.scan.forEach(p => {
+      mapCtx.fillRect(p.x - dot/2, p.y - dot/2, dot, dot);
+    });
+  }
+
+  if (meta.path?.length > 1) {
+    mapCtx.save();
+    mapCtx.strokeStyle = '#38bdf8'; mapCtx.lineWidth = 2 / z;
+    mapCtx.shadowColor = 'rgba(56,189,248,0.5)'; mapCtx.shadowBlur = 6 / z;
+    mapCtx.beginPath();
+    meta.path.forEach((p, i) => { if (i === 0) mapCtx.moveTo(p.x, p.y); else mapCtx.lineTo(p.x, p.y); });
+    mapCtx.stroke(); mapCtx.restore();
+  }
+
+  if (STATE.pendingGoal && STATE.mapMeta) {
+    const res = meta.resolution || 0.02;
+    const ox = meta.origin[0], oy = meta.origin[1];
+    const gx = (STATE.pendingGoal.x - ox) / res;
+    const gy = (STATE.pendingGoal.y - oy) / res;
+    const c = toC({ x: gx, y: gy });
+    mapCtx.save();
+    mapCtx.strokeStyle = '#60a5fa'; mapCtx.lineWidth = 1.5 / z;
+    mapCtx.setLineDash([3 / z, 2 / z]);
+    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 3 / z, 0, Math.PI * 2); mapCtx.stroke();
+    mapCtx.setLineDash([]);
+    mapCtx.beginPath();
+    mapCtx.moveTo(c.x, c.y - 8 / z); mapCtx.lineTo(c.x, c.y + 8 / z);
+    mapCtx.moveTo(c.x - 8 / z, c.y); mapCtx.lineTo(c.x + 8 / z, c.y);
+    mapCtx.stroke(); mapCtx.restore();
+  }
+
+  if (meta.goal) {
+    const c = toC(meta.goal);
+    mapCtx.save();
+    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 2 / z;
+    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 6 / z;
+    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 3.5 / z, 0, Math.PI * 2); mapCtx.stroke();
+    mapCtx.beginPath();
+    mapCtx.moveTo(c.x, c.y - 10 / z); mapCtx.lineTo(c.x, c.y + 10 / z);
+    mapCtx.moveTo(c.x - 10 / z, c.y); mapCtx.lineTo(c.x + 10 / z, c.y);
+    mapCtx.stroke(); mapCtx.restore();
+  }
+
+  const pois = meta.pois || [];
+  pois.forEach(poi => {
+    const c = toC({ x: poi.px, y: poi.py });
+    const r = 8 / z;
+    mapCtx.save();
+    mapCtx.fillStyle = 'rgba(251,191,36,0.2)';
+    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, r * 1.6, 0, Math.PI*2); mapCtx.fill();
+    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 1.5 / z;
+    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 4 / z;
+    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, r, 0, Math.PI*2); mapCtx.stroke();
+    mapCtx.restore();
+    mapCtx.save();
+    mapCtx.font = `${11 / z}px sans-serif`;
+    mapCtx.textAlign = 'center'; mapCtx.textBaseline = 'top';
+    mapCtx.fillStyle = '#fbbf24';
+    mapCtx.shadowColor = '#000'; mapCtx.shadowBlur = 2 / z;
+    mapCtx.fillText(poi.label, c.x, c.y + r + 1 / z);
+    mapCtx.restore();
+  });
+
+  if (meta.pose) {
+    const c   = toC(meta.pose);
+    const th  = meta.pose.theta;
+    const ppm = 1 / meta.resolution;
+    const rL  = 0.520 / 2 * ppm;
+    const rW  = 0.500 / 2 * ppm;
+    mapCtx.save();
+    mapCtx.translate(c.x, c.y);
+    mapCtx.rotate(th);
+    mapCtx.fillStyle = 'rgba(56,189,248,0.15)';
+    mapCtx.fillRect(-rW, -rL, rW * 2, rL * 2);
+    mapCtx.strokeStyle = 'rgba(56,189,248,0.6)'; mapCtx.lineWidth = 1.5 / z;
+    mapCtx.strokeRect(-rW, -rL, rW * 2, rL * 2);
+    mapCtx.strokeStyle = '#34d399'; mapCtx.lineWidth = 2.5 / z;
+    mapCtx.shadowColor = 'rgba(52,211,153,0.6)'; mapCtx.shadowBlur = 6 / z;
+    mapCtx.beginPath(); mapCtx.moveTo(-rW, rL); mapCtx.lineTo(rW, rL); mapCtx.stroke();
+    mapCtx.shadowBlur = 0;
+    mapCtx.fillStyle = '#38bdf8';
+    mapCtx.shadowColor = 'rgba(56,189,248,0.6)'; mapCtx.shadowBlur = 8 / z;
+    const ar = Math.max(3 / z, rL * 0.5);
+    mapCtx.beginPath();
+    mapCtx.moveTo(0, rL - ar * 0.2); mapCtx.lineTo(-ar * 0.5, rL - ar); mapCtx.lineTo(ar * 0.5, rL - ar);
+    mapCtx.closePath(); mapCtx.fill();
+    mapCtx.restore();
+  }
+
+  mapCtx.restore();
+
+  const vw = cw / z, vh = ch / z;
+  const pixelsPerM_screen = vw / (meta.width * meta.resolution);
+  const bar1m_s = pixelsPerM_screen;
+  mapCtx.save();
+  mapCtx.fillStyle = 'rgba(255,255,255,0.85)';
+  mapCtx.fillRect(12, ch - 22, bar1m_s, 3);
+  mapCtx.font = '8px monospace'; mapCtx.textAlign = 'left'; mapCtx.fillStyle = 'rgba(255,255,255,0.75)';
+  mapCtx.fillText('1 m', 12 + bar1m_s + 3, ch - 18);
+  const bar5m_s = 5 * pixelsPerM_screen;
+  mapCtx.fillStyle = 'rgba(56,189,248,0.55)';
+  mapCtx.fillRect(12, ch - 12, bar5m_s, 3);
+  mapCtx.fillStyle = 'rgba(56,189,248,0.7)';
+  mapCtx.fillText('5 m', 12 + bar5m_s + 3, ch - 10);
+  mapCtx.textAlign = 'right'; mapCtx.fillStyle = 'rgba(99,130,180,0.5)';
+  mapCtx.fillText(`${(meta.resolution * 100)|0} cm/px`, cw - 6, ch - 6);
+  mapCtx.restore();
+}
+  } else {
+    mapCtx.fillStyle = '#0f1729';
+    mapCtx.fillRect(panX, panY, vw, vh);
+  }
+
+  const toC = p => ({
+    x: p.x * scale + panX,
+    y: p.y * scale + panY
+  });
+
+  const step = Math.max(5, Math.round(1.0 / meta.resolution));
+  mapCtx.save();
+  mapCtx.strokeStyle = 'rgba(255,255,255,0.05)'; mapCtx.lineWidth = 1 / scale;
+  for (let x = 0; x <= meta.width; x += step) {
+    const px = x + panX;
+    mapCtx.beginPath(); mapCtx.moveTo(px, panY); mapCtx.lineTo(px, panY + vh); mapCtx.stroke();
+  }
+  for (let y = 0; y <= meta.height; y += step) {
+    const py = y + panY;
+    mapCtx.beginPath(); mapCtx.moveTo(panX, py); mapCtx.lineTo(panX + vw, py); mapCtx.stroke();
   }
   mapCtx.restore();
 
-  // Scan points
   if (meta.scan?.length) {
-    mapCtx.fillStyle = 'rgba(52,211,153,0.85)';
-    meta.scan.forEach(p => { const c = toC(p); mapCtx.fillRect(c.x-1.5, c.y-1.5, 3, 3); });
+    mapCtx.fillStyle = 'rgba(52,211,153,0.7)';
+    const dot = 1.5 / scale;
+    meta.scan.forEach(p => {
+      const c = toC(p);
+      mapCtx.fillRect(c.x - dot/2, c.y - dot/2, dot, dot);
+    });
   }
 
-  // Path
   if (meta.path?.length > 1) {
     mapCtx.save();
-    mapCtx.strokeStyle = '#38bdf8'; mapCtx.lineWidth = 3;
-    mapCtx.shadowColor = 'rgba(56,189,248,0.4)'; mapCtx.shadowBlur = 12;
+    mapCtx.strokeStyle = '#38bdf8'; mapCtx.lineWidth = 2 / scale;
+    mapCtx.shadowColor = 'rgba(56,189,248,0.5)'; mapCtx.shadowBlur = 6 / scale;
     mapCtx.beginPath();
     meta.path.forEach((p, i) => { const c = toC(p); if (i === 0) mapCtx.moveTo(c.x, c.y); else mapCtx.lineTo(c.x, c.y); });
     mapCtx.stroke(); mapCtx.restore();
   }
 
-  // Pending goal (placed on map but mission not yet started)
   if (STATE.pendingGoal && STATE.mapMeta) {
     const c = toC(STATE.pendingGoal);
     mapCtx.save();
-    mapCtx.strokeStyle = '#60a5fa'; mapCtx.lineWidth = 2;
-    mapCtx.shadowColor = '#60a5fa'; mapCtx.shadowBlur = 8;
-    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 7, 0, Math.PI * 2); mapCtx.stroke();
-    mapCtx.setLineDash([4, 3]);
+    mapCtx.strokeStyle = '#60a5fa'; mapCtx.lineWidth = 1.5 / scale;
+    mapCtx.setLineDash([3 / scale, 2 / scale]);
+    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 3 / scale, 0, Math.PI * 2); mapCtx.stroke();
+    mapCtx.setLineDash([]);
     mapCtx.beginPath();
-    mapCtx.moveTo(c.x, c.y-12); mapCtx.lineTo(c.x, c.y+12);
-    mapCtx.moveTo(c.x-12, c.y); mapCtx.lineTo(c.x+12, c.y);
+    mapCtx.moveTo(c.x, c.y - 8 / scale); mapCtx.lineTo(c.x, c.y + 8 / scale);
+    mapCtx.moveTo(c.x - 8 / scale, c.y); mapCtx.lineTo(c.x + 8 / scale, c.y);
     mapCtx.stroke(); mapCtx.restore();
   }
 
-  // Goal
   if (meta.goal) {
     const c = toC(meta.goal);
     mapCtx.save();
-    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 2.5;
-    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 10;
-    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 8, 0, Math.PI * 2); mapCtx.stroke();
+    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 2 / scale;
+    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 6 / scale;
+    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, 3.5 / scale, 0, Math.PI * 2); mapCtx.stroke();
     mapCtx.beginPath();
-    mapCtx.moveTo(c.x, c.y-14); mapCtx.lineTo(c.x, c.y+14);
-    mapCtx.moveTo(c.x-14, c.y); mapCtx.lineTo(c.x+14, c.y);
+    mapCtx.moveTo(c.x, c.y - 10 / scale); mapCtx.lineTo(c.x, c.y + 10 / scale);
+    mapCtx.moveTo(c.x - 10 / scale, c.y); mapCtx.lineTo(c.x + 10 / scale, c.y);
     mapCtx.stroke(); mapCtx.restore();
   }
 
   // POIs
   const pois = meta.pois || [];
   pois.forEach(poi => {
-    const cx = (poi.px / meta.width)  * cw;
-    const cy = (poi.py / meta.height) * ch;
-    // Halo
+    const c = toC({ x: poi.px, y: poi.py });
+    const r = 8 / scale;
     mapCtx.save();
-    mapCtx.fillStyle = 'rgba(251,191,36,0.18)';
-    mapCtx.beginPath(); mapCtx.arc(cx, cy, 14, 0, Math.PI*2); mapCtx.fill();
-    // Border ring
-    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 2;
-    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 8;
-    mapCtx.beginPath(); mapCtx.arc(cx, cy, 10, 0, Math.PI*2); mapCtx.stroke();
+    mapCtx.fillStyle = 'rgba(251,191,36,0.2)';
+    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, r * 1.6, 0, Math.PI*2); mapCtx.fill();
+    mapCtx.strokeStyle = '#fbbf24'; mapCtx.lineWidth = 1.5 / scale;
+    mapCtx.shadowColor = '#fbbf24'; mapCtx.shadowBlur = 4 / scale;
+    mapCtx.beginPath(); mapCtx.arc(c.x, c.y, r, 0, Math.PI*2); mapCtx.stroke();
     mapCtx.restore();
-    // Icon emoji
-    mapCtx.font = '13px sans-serif';
-    mapCtx.textAlign = 'center'; mapCtx.textBaseline = 'middle';
-    const icons = { gazebo:'⛺', waypoint:'📍', dock:'🔌', custom:'⭐' };
-    mapCtx.fillText(icons[poi.kind] || '⭐', cx, cy);
-    // Label below
     mapCtx.save();
-    mapCtx.font = 'bold 9px sans-serif';
-    mapCtx.fillStyle = '#fbbf24';
+    mapCtx.font = `${11 / scale}px sans-serif`;
     mapCtx.textAlign = 'center'; mapCtx.textBaseline = 'top';
-    mapCtx.shadowColor = '#000'; mapCtx.shadowBlur = 3;
-    mapCtx.fillText(poi.label, cx, cy + 12);
+    mapCtx.fillStyle = '#fbbf24';
+    mapCtx.shadowColor = '#000'; mapCtx.shadowBlur = 2 / scale;
+    mapCtx.fillText(poi.label, c.x, c.y + r + 1 / scale);
     mapCtx.restore();
   });
 
-  // Robot — scaled rectangle matching physical body (520×500 mm)
-  // In map pixel space: pixPerM = cw / (meta.width * meta.resolution)
+  // Robot — scaled rectangle (520×500 mm)
   if (meta.pose) {
     const c   = toC(meta.pose);
     const th  = meta.pose.theta;
-    const ppm = cw / (meta.width * (meta.resolution || 0.05));  // pixels per metre
-    const rL  = 0.520 / 2 * ppm;   // half-length px (front-back)
-    const rW  = 0.500 / 2 * ppm;   // half-width  px (left-right)
+    const ppm = 1 / meta.resolution;  // map pixels per metre
+    const rL  = 0.520 / 2 * ppm;   // half-length in map pixels
+    const rW  = 0.500 / 2 * ppm;   // half-width  in map pixels
     mapCtx.save();
     mapCtx.translate(c.x, c.y);
-    // Map convention: x=right, y=down on canvas; robot x=fwd mapped to canvas x=right at theta=0
     mapCtx.rotate(th);
-    // Body fill
-    mapCtx.fillStyle = 'rgba(56,189,248,0.12)';
+    mapCtx.fillStyle = 'rgba(56,189,248,0.15)';
     mapCtx.fillRect(-rW, -rL, rW * 2, rL * 2);
-    // Body outline
-    mapCtx.strokeStyle = 'rgba(56,189,248,0.55)'; mapCtx.lineWidth = 1.5;
+    mapCtx.strokeStyle = 'rgba(56,189,248,0.6)'; mapCtx.lineWidth = 1.5 / scale;
     mapCtx.strokeRect(-rW, -rL, rW * 2, rL * 2);
-    // Front edge (green)
-    mapCtx.strokeStyle = '#34d399'; mapCtx.lineWidth = 2.5;
-    mapCtx.shadowColor = 'rgba(52,211,153,0.5)'; mapCtx.shadowBlur = 8;
+    mapCtx.strokeStyle = '#34d399'; mapCtx.lineWidth = 2.5 / scale;
+    mapCtx.shadowColor = 'rgba(52,211,153,0.6)'; mapCtx.shadowBlur = 6 / scale;
     mapCtx.beginPath(); mapCtx.moveTo(-rW, rL); mapCtx.lineTo(rW, rL); mapCtx.stroke();
     mapCtx.shadowBlur = 0;
-    // Direction arrow
     mapCtx.fillStyle = '#38bdf8';
-    mapCtx.shadowColor = 'rgba(56,189,248,0.6)'; mapCtx.shadowBlur = 10;
+    mapCtx.shadowColor = 'rgba(56,189,248,0.6)'; mapCtx.shadowBlur = 8 / scale;
+    const ar = Math.max(3 / scale, rL * 0.5);
     mapCtx.beginPath();
-    const ar = Math.max(3, rL * 0.55);
     mapCtx.moveTo(0, rL - ar * 0.2); mapCtx.lineTo(-ar * 0.5, rL - ar); mapCtx.lineTo(ar * 0.5, rL - ar);
     mapCtx.closePath(); mapCtx.fill();
-    mapCtx.shadowBlur = 0;
     mapCtx.restore();
   }
 
-  // ── Scale bar with dual units ────────────────────────────────────────────────
-  const pixelsPerM = cw / (meta.width * (meta.resolution || 0.05));
+  mapCtx.restore(); // end world-space rendering
+
+  // HUD: scale bar (screen space, bottom-left)
+  const pixelsPerM_screen = vw / (meta.width * meta.resolution) * scale;
+  const bar1m_s = pixelsPerM_screen;
   mapCtx.save();
-  // 1 m bar
-  const bar1m = 1 * pixelsPerM;
-  mapCtx.fillStyle = 'rgba(255,255,255,0.85)'; mapCtx.globalAlpha = 1;
-  mapCtx.fillRect(12, ch - 24, bar1m, 3);
-  mapCtx.fillStyle = 'rgba(255,255,255,0.70)';
-  mapCtx.fillRect(12, ch - 19, bar1m * 0.5, 2);  // 50 cm half-bar
+  mapCtx.fillStyle = 'rgba(255,255,255,0.85)';
+  mapCtx.fillRect(12, ch - 22, bar1m_s, 3);
   mapCtx.font = '8px monospace'; mapCtx.textAlign = 'left'; mapCtx.fillStyle = 'rgba(255,255,255,0.75)';
-  mapCtx.fillText('50cm', 12 + bar1m * 0.5 + 2, ch - 17);
-  mapCtx.fillText('1 m',  12 + bar1m + 2,        ch - 22);
-  // 5 m bar
-  const bar5m = 5 * pixelsPerM;
+  mapCtx.fillText('1 m', 12 + bar1m_s + 3, ch - 18);
+  const bar5m_s = 5 * pixelsPerM_screen;
   mapCtx.fillStyle = 'rgba(56,189,248,0.55)';
-  mapCtx.fillRect(12, ch - 12, bar5m, 3);
-  mapCtx.fillStyle = 'rgba(56,189,248,0.70)';
-  mapCtx.fillText('5 m', 12 + bar5m + 2, ch - 10);
-  // Grid info
-  mapCtx.fillStyle = 'rgba(99,130,180,0.45)'; mapCtx.textAlign = 'right';
-  mapCtx.fillText(`${(meta.resolution || 0.05)*100|0} cm/cell`, cw - 8, ch - 8);
+  mapCtx.fillRect(12, ch - 12, bar5m_s, 3);
+  mapCtx.fillStyle = 'rgba(56,189,248,0.7)';
+  mapCtx.fillText('5 m', 12 + bar5m_s + 3, ch - 10);
+  mapCtx.textAlign = 'right'; mapCtx.fillStyle = 'rgba(99,130,180,0.5)';
+  mapCtx.fillText(`${(meta.resolution * 100)|0} cm/px`, cw - 6, ch - 6);
   mapCtx.restore();
 }
 
@@ -1267,6 +1378,11 @@ setInterval(refreshMapList, 10000);
 
 // Initialise map canvas cursor and tool hint
 setTool('goal');
+
+// ResizeObserver — re-fit canvas on container resize
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(() => { if (EL.mapOuter) refreshMap(); }).observe(EL.mapOuter);
+}
 
 // ── Live Tuning panel ─────────────────────────────────────────────────────────
 const EL_tuningRows     = document.getElementById('tuning-rows');

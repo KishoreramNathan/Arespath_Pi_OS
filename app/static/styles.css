@@ -495,15 +495,13 @@ i.lg.path     { background: var(--accent); }
   overflow: hidden;
   position: relative;
   border-radius: var(--radius-sm);
-  background: #1a2236;
+  background: #0f1729;
   touch-action: none;
 }
 .map-outer canvas {
   display: block;
   width: 100%;
-  max-width: 820px;
-  transition: transform 0.05s linear;
-  transform-origin: 50% 50%;
+  image-rendering: pixelated;
 }
 
 /* Map size badge */

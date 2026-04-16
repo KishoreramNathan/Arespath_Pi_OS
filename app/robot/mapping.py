@@ -41,7 +41,10 @@ class OccupancyGridMap:
         self.origin_x = config.MAP_ORIGIN_X_M
         self.origin_y = config.MAP_ORIGIN_Y_M
         self.log_odds = np.zeros((self.size, self.size), dtype=np.float32)
-        self._scan_count = 0  # Track scans for stability
+        self._scan_count = 0
+        self._png_cache = None
+        self._png_cache_time = 0.0
+        self._png_cache_mtime = 0.0
 
     # ── Coordinate helpers ────────────────────────────────────────────────────
 
@@ -72,12 +75,7 @@ class OccupancyGridMap:
         
         self._scan_count += 1
         
-        # Reject zero/NaN readings early
-        valid = [(a, d) for a, d in scan if math.isfinite(d) and d > 0.02]
-        if not valid:
-            return
-        
-        for angle, dist in valid:
+        for angle, dist in scan:
             global_angle = pose.theta + angle
             wx = pose.x + dist * math.cos(global_angle)
             wy = pose.y + dist * math.sin(global_angle)
@@ -185,10 +183,14 @@ class OccupancyGridMap:
         goal: Optional[Tuple[float, float]] = None,
         scan_px: Optional[list] = None,
     ) -> dict:
-        img = self.as_display_image()
-        buf = io.BytesIO()
-        Image.fromarray(img).save(buf, format="PNG", optimize=True)
-        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        import time
+        now = time.monotonic()
+        if self._png_cache is None or (now - self._png_cache_time) > 0.5:
+            img = self.as_display_image()
+            buf = io.BytesIO()
+            Image.fromarray(img).save(buf, format="PNG", optimize=False)
+            self._png_cache = base64.b64encode(buf.getvalue()).decode("ascii")
+            self._png_cache_time = now
 
         pose_px = None
         if pose is not None:
@@ -207,9 +209,9 @@ class OccupancyGridMap:
             goal_px = {"x": gx, "y": gy}
 
         return {
-            "width":           int(img.shape[1]),
-            "height":          int(img.shape[0]),
-            "image_png_b64":   encoded,
+            "width":           self.size,
+            "height":          self.size,
+            "image_png_b64":   self._png_cache,
             "pose":            pose_px,
             "path":            path_px,
             "goal":            goal_px,
