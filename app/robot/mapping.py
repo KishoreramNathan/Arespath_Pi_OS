@@ -185,32 +185,38 @@ class OccupancyGridMap:
     ) -> dict:
         import time
         now = time.monotonic()
+        thumb_size = 800
         if self._png_cache is None or (now - self._png_cache_time) > 0.5:
             img = self.as_display_image()
+            thumb = Image.fromarray(img).resize((thumb_size, thumb_size), Image.Resampling.LANCZOS)
             buf = io.BytesIO()
-            Image.fromarray(img).save(buf, format="PNG", optimize=False)
+            thumb.save(buf, format="PNG", optimize=False)
             self._png_cache = base64.b64encode(buf.getvalue()).decode("ascii")
             self._png_cache_time = now
+            self._thumb_size = thumb_size
+
+        scale = self.size / thumb_size  # grid to thumbnail scale
 
         pose_px = None
         if pose is not None:
             gx, gy = self.world_to_grid(pose.x, pose.y)
-            pose_px = {"x": gx, "y": gy, "theta": pose.theta}
+            pose_px = {"x": gx / scale, "y": gy / scale, "theta": pose.theta}
 
         path_px = []
         if path:
             for wx, wy in path:
                 gx, gy = self.world_to_grid(wx, wy)
-                path_px.append({"x": gx, "y": gy})
+                path_px.append({"x": gx / scale, "y": gy / scale})
 
         goal_px = None
         if goal is not None:
             gx, gy = self.world_to_grid(goal[0], goal[1])
-            goal_px = {"x": gx, "y": gy}
+            goal_px = {"x": gx / scale, "y": gy / scale}
 
         return {
-            "width":           self.size,
-            "height":          self.size,
+            "width":           thumb_size,
+            "height":          thumb_size,
+            "grid_size":       self.size,
             "image_png_b64":   self._png_cache,
             "pose":            pose_px,
             "path":            path_px,

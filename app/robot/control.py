@@ -341,11 +341,12 @@ class RobotRuntime:
                 self.state.nav.goal,
                 scan_px=scan_px,
             )
-        # Add POIs as pixel coordinates for canvas rendering
+        scale = self.map.size / 800.0
+        # Add POIs as pixel coordinates for canvas rendering (scaled to thumbnail)
         pois_px = []
         for poi in self.poi.list():
             gx, gy = self.map.world_to_grid(poi["x"], poi["y"])
-            pois_px.append({**poi, "px": gx, "py": gy})
+            pois_px.append({**poi, "px": gx / scale, "py": gy / scale})
         payload["pois"] = pois_px
         return payload
 
@@ -354,11 +355,13 @@ class RobotRuntime:
 
         Uses the same world→grid transform as OccupancyGridMap.update_from_scan
         so live scan dots align exactly with the mapped obstacles.
+        Returns thumbnail-sized coordinates for efficient UI rendering.
         """
         out = []
         if not scan:
             return out
-        step = max(1, len(scan) // 720)   # up to 720 points for density
+        step = max(1, len(scan) // 360)   # up to 360 points for density
+        scale = self.map.size / 800.0  # grid to thumbnail scale
         pose = self.state.pose
         for angle, dist in scan[::step]:
             if dist <= 0:
@@ -368,7 +371,7 @@ class RobotRuntime:
             wy = pose.y + dist * math.sin(global_angle)
             gx, gy = self.map.world_to_grid(wx, wy)
             if self.map.in_bounds(gx, gy):
-                out.append({"x": gx, "y": gy})
+                out.append({"x": gx / scale, "y": gy / scale})  # scale to thumbnail
         return out
 
     # ── 20 Hz control loop ────────────────────────────────────────────────────
