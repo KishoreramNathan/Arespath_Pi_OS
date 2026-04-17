@@ -18,9 +18,11 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from typing import List, Optional, Tuple
 
 from app import config
+from app.robot.messages import RangeScanFrame
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +35,9 @@ class LidarManager:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._scan: Scan = []
+        self._stamp: float = 0.0
+        self._seq: int = 0
+        self._history: deque[RangeScanFrame] = deque(maxlen=5)
         self.connected = False
         self.error: Optional[str] = None
 
@@ -55,6 +60,19 @@ class LidarManager:
     def get_scan(self) -> Scan:
         with self._lock:
             return list(self._scan)
+
+    def get_scan_frame(self) -> RangeScanFrame:
+        with self._lock:
+            return RangeScanFrame(
+                stamp=self._stamp,
+                points=list(self._scan),
+                source="lidar",
+                sequence=self._seq,
+            )
+
+    def recent_frames(self) -> List[RangeScanFrame]:
+        with self._lock:
+            return list(self._history)
 
     def scan_cartesian(self, limit: Optional[int] = None) -> List[dict]:
         points = self.get_scan()
@@ -127,6 +145,16 @@ class LidarManager:
                         points.append((angle, dist))
                 with self._lock:
                     self._scan = points
+                    self._stamp = time.time()
+                    self._seq += 1
+                    self._history.append(
+                        RangeScanFrame(
+                            stamp=self._stamp,
+                            points=list(points),
+                            source="lidar",
+                            sequence=self._seq,
+                        )
+                    )
                 time.sleep(0.01)
 
             laser.turnOff()
@@ -154,6 +182,16 @@ class LidarManager:
                 points.append((angle, dist))
             with self._lock:
                 self._scan = points
+                self._stamp = time.time()
+                self._seq += 1
+                self._history.append(
+                    RangeScanFrame(
+                        stamp=self._stamp,
+                        points=list(points),
+                        source="lidar",
+                        sequence=self._seq,
+                    )
+                )
             t += 0.15
             time.sleep(0.17)   # ~6 Hz mock update
 
