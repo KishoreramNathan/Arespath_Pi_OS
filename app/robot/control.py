@@ -473,39 +473,6 @@ class RobotRuntime:
 
         log.info("Planner worker stopped")
 
-    def _planner_plan(self, scan: Optional[List[Tuple[float, float]]] = None) -> List[Tuple[float, float]]:
-        """Plan path using dynamic planner."""
-        goal = self.state.nav.goal
-        if goal is None:
-            return []
-
-        occ = self.map.occupancy_for_planner()
-        if scan:
-            occ = self.map.overlay_scan_on_occupancy(self.state.pose, scan, occupancy=occ)
-
-        self._planner.update_static_map(occ)
-        self._planner.update_dynamic_obstacles(
-            pose=(self.state.pose.x, self.state.pose.y, self.state.pose.theta),
-            scan=scan or [],
-            grid_origin=(config.MAP_ORIGIN_X_M, config.MAP_ORIGIN_Y_M),
-        )
-
-        start = (self.state.pose.x, self.state.pose.y)
-        raw_path = self._planner.plan(
-            start=start,
-            goal=goal,
-            grid_origin=(config.MAP_ORIGIN_X_M, config.MAP_ORIGIN_Y_M),
-            use_jps=True,
-        )
-
-        if not raw_path:
-            return []
-
-        smoothed = self._path_smoother.smooth(raw_path)
-        TrajectoryTracker._trajectory_cache = smoothed.points
-
-        return [(pt.x, pt.y) for pt in smoothed.points]
-
     def _ctrl_loop(self) -> None:
         """Main 50 Hz control loop."""
         import queue as _queue
@@ -597,7 +564,8 @@ class RobotRuntime:
         self.state.pose.theta = wrap_angle(self.state.pose.theta + dtheta)
 
     def _obstacle_in_cone(self, scan: List[Tuple[float, float]]) -> bool:
-        cone = math.radians(rtcfg.get("obstacle_detection_cone_deg", 25))
+        cone_deg = rtcfg.get("obstacle_detection_cone_deg")
+        cone = math.radians(cone_deg)
         stop_dist = rtcfg.get("obstacle_stop_distance_m")
         for angle, dist in scan:
             if abs(angle) < cone and 0 < dist < stop_dist:

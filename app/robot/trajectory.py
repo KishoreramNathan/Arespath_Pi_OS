@@ -229,9 +229,23 @@ class PathSmoother:
             t += dt
             pt.dt = t
 
+    def _compute_path_length(self, trajectory: List[TrajectoryPoint]) -> float:
+        """Compute total path length."""
+        if len(trajectory) < 2:
+            return 0.0
+        total = 0.0
+        for i in range(1, len(trajectory)):
+            total += math.hypot(
+                trajectory[i].x - trajectory[i - 1].x,
+                trajectory[i].y - trajectory[i - 1].y,
+            )
+        return total
+
 
 class TrajectoryTracker:
     """Pure pursuit controller with dynamic lookahead and PID heading control."""
+
+    _trajectory_cache: List[TrajectoryPoint] = []
 
     def __init__(
         self,
@@ -307,7 +321,7 @@ class TrajectoryTracker:
             + self.kd_angular * heading_derivative
         )
 
-        angular_cmd = np.clip(angular_cmd, -1.5, 1.5)
+        angular_cmd = np.clip(angular_raw, -1.5, 1.5)
 
         linear_raw = target_v * self.kp_linear
 
@@ -354,8 +368,6 @@ class TrajectoryTracker:
             best_idx = min(3, trajectory_length - 1)
 
         return best_idx
-
-    def _trajectory_cache: List[TrajectoryPoint] = []
 
     def set_trajectory(self, trajectory: List[TrajectoryPoint]) -> None:
         """Cache trajectory for tracking."""
