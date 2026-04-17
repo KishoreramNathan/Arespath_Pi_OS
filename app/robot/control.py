@@ -1,29 +1,24 @@
-"""RobotRuntime — ROS-like navigation stack for Arespath Rover.
+"""RobotRuntime — Simplified Robust Navigation Stack.
 
-v7 Architecture (ROS Nav Stack inspired):
-─────────────────────────────────────────
-• Sensor Processing: LiDAR + radar fusion, dynamic obstacle detection
-• Localization: ICP-corrected odometry (sensor fusion)
-• Global Planner: JPS pathfinding with dynamic obstacle integration
-• Local Planner: Spline-smoothed trajectory with velocity profiling
-• Controller: Pure pursuit + PID heading control
-• Motor Control: Smooth velocity commands with acceleration limiting
+Focus: Mapping, Path Making, Path Following, Stop & Replan.
+
+Key Features:
+• Sensor Fusion: Telemetry (odometry) + LiDAR ICP correction
+• Simple A* path planner
+• Direct waypoint following (no complex splines)
+• Multi-waypoint mission support (x1,y1 → x2,y2 → x3,y3)
+• Stable obstacle detection (5 sec wait before replan)
 
 Thread Model:
-  robot-ctrl (50 Hz)  — odometry, localization, nav/motor commands
+  robot-ctrl (20 Hz)  — odometry, localization, nav/motor commands
   cmd-worker          — event-driven command serializer
   serial-reader       — background telemetry reader
-  map-pusher (10 Hz)  — WebSocket map payload push
-  planner-worker      — async path planning
+  map-worker          — SLAM map updates
   monitor             — heartbeat + reconnect watchdog
-
-This is the main orchestration layer that integrates all subsystems into
-a cohesive ROS-like navigation stack.
 """
 
 import logging
 import math
-import queue
 import threading
 import time
 from typing import List, Optional, Tuple
@@ -31,18 +26,16 @@ from typing import List, Optional, Tuple
 from app import config
 from app.robot.command_bus import DriveCommandQueue
 from app.robot.lidar import LidarLocalizer, LidarManager
-from app.robot.map_renderer import MapRenderer
 from app.robot.mapping import OccupancyGridMap
-from app.robot.planner_adv import DynamicPlanner, inflate_obstacles, nearest_free_point
+from app.robot.planner import astar, inflate_occupancy, nearest_free_cell, simplify_path
 from app.robot.poi import PoiManager
-from app.robot.trajectory import PathSmoother, SmoothedPath, TrajectoryPoint, TrajectoryTracker
 from app.robot.runtime_cfg import rtcfg
 from app.robot.serial_bridge import ArduinoBridge
 from app.robot.state import Pose, RobotState, wrap_angle
 
 log = logging.getLogger(__name__)
 
-_CONTROL_HZ = 50.0
+_CONTROL_HZ = 20.0
 _CONTROL_DT = 1.0 / _CONTROL_HZ
 
 
@@ -50,12 +43,6 @@ class RobotRuntime:
     def __init__(self) -> None:
         self.state = RobotState()
         self.map = OccupancyGridMap()
-        self.map_renderer = MapRenderer(
-            grid_size=config.MAP_SIZE_CELLS,
-            resolution=config.MAP_RESOLUTION_M,
-            origin_x=config.MAP_ORIGIN_X_M,
-            origin_y=config.MAP_ORIGIN_Y_M,
-        )
         self.lidar = LidarManager()
         self.localizer = LidarLocalizer()
         self.bridge = ArduinoBridge(on_telemetry=self._on_telemetry)
@@ -66,59 +53,18 @@ class RobotRuntime:
         self._running = False
         self._ctrl_thread: Optional[threading.Thread] = None
         self._monitor_thread: Optional[threading.Thread] = None
-        self._map_pusher: Optional[threading.Thread] = None
-        self._planner_thread: Optional[threading.Thread] = None
-        self._map_pusher_event = threading.Event()
         self._socketio = None
 
         self._last_ticks: Optional[Tuple[int, int]] = None
         self._last_tel_ts: Optional[float] = None
 
-        self._manual_expires_at: float = 0.0
         self._last_heartbeat: float = time.time()
 
-        self._obstacle_reverse_until: float = 0.0
-        self._obstacle_blocked_at: float = 0.0
-        self._replanning_after_obs: bool = False
+        self._obstacle_detected_at: float = 0.0
+        self._is_obstacle_stable: bool = False
 
-        self._last_map_push: float = 0.0
-        self._map_push_interval: float = 0.1
-
-        self._planner = DynamicPlanner(
-            grid_size=config.MAP_SIZE_CELLS,
-            resolution=config.MAP_RESOLUTION_M,
-            inflation_radius=config.PLANNER_INFLATION_CELLS,
-        )
-
-        self._path_smoother = PathSmoother(
-            resolution=0.05,
-            max_velocity=config.MAX_LINEAR_MPS,
-            max_acceleration=rtcfg.get("nav_max_acceleration"),
-            lookahead=rtcfg.get("trajectory_lookahead_m"),
-        )
-
-        self._trajectory_tracker = TrajectoryTracker(
-            lookahead_min=rtcfg.get("lookahead_min_m"),
-            lookahead_max=rtcfg.get("lookahead_max_m"),
-            lookahead_gain=rtcfg.get("lookahead_gain"),
-            kp_angular=rtcfg.get("kp_angular"),
-            ki_angular=rtcfg.get("ki_angular"),
-            kd_angular=rtcfg.get("kd_angular"),
-            kp_linear=rtcfg.get("kp_linear"),
-        )
-
-        self._current_trajectory: List[TrajectoryPoint] = []
-        self._current_smoothed_path: SmoothedPath = SmoothedPath()
-        self._planner_request_queue: queue.Queue = queue.Queue(maxsize=2)
-        self._planner_result: Optional[List[Tuple[float, float]]] = None
-
-        self._target_linear: float = 0.0
-        self._target_angular: float = 0.0
-        self._current_linear: float = 0.0
-        self._current_angular: float = 0.0
-
-        self._last_replan_time: float = 0.0
-        self._path_valid: bool = False
+        self._mission_waypoints: List[Tuple[float, float]] = []
+        self._current_waypoint_idx: int = 0
 
     def set_socketio(self, sio) -> None:
         self._socketio = sio
@@ -133,35 +79,23 @@ class RobotRuntime:
         self.lidar.start()
         self.queue.start()
 
-        self._planner_thread = threading.Thread(
-            target=self._planner_loop, daemon=True, name="planner-worker"
-        )
-        self._planner_thread.start()
-
         self._ctrl_thread = threading.Thread(
             target=self._ctrl_loop, daemon=True, name="robot-ctrl"
         )
         self._ctrl_thread.start()
-
-        self._map_pusher = threading.Thread(
-            target=self._map_push_loop, daemon=True, name="map-pusher"
-        )
-        self._map_pusher.start()
 
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop, daemon=True, name="robot-monitor"
         )
         self._monitor_thread.start()
 
-        log.info("RobotRuntime started (v7 ROS-like navigation stack)")
+        log.info("RobotRuntime started (simplified navigation)")
 
     def stop(self) -> None:
         self._running = False
-        self._map_pusher_event.set()
         self.queue.stop()
         self.bridge.close()
         self.lidar.stop()
-        self.map_renderer.shutdown()
         log.info("RobotRuntime stopped")
 
     def _on_telemetry(self, data: dict) -> None:
@@ -185,8 +119,6 @@ class RobotRuntime:
             if not self.state.armed:
                 self.state.linear_cmd = 0.0
                 self.state.angular_cmd = 0.0
-                self._current_linear = 0.0
-                self._current_angular = 0.0
         if not armed:
             self.queue.push_stop()
 
@@ -197,9 +129,6 @@ class RobotRuntime:
             self.state.linear_cmd = max(-1.0, min(1.0, linear))
             self.state.angular_cmd = max(-1.0, min(1.0, angular))
             self.state.mode = "pilot"
-            self._manual_expires_at = time.time() + config.MANUAL_COMMAND_TIMEOUT_S
-            self._current_trajectory = []
-            self._path_valid = False
         left_pwm, right_pwm = self._cmd_to_pwm(linear, angular)
         self.queue.push_manual(left_pwm, right_pwm)
 
@@ -207,10 +136,6 @@ class RobotRuntime:
         with self.lock:
             self.state.linear_cmd = 0.0
             self.state.angular_cmd = 0.0
-            self._current_linear = 0.0
-            self._current_angular = 0.0
-            self._current_trajectory = []
-            self._path_valid = False
         self.queue.push_stop()
 
     def heartbeat(self) -> None:
@@ -228,6 +153,7 @@ class RobotRuntime:
                 self._cancel_nav_locked()
 
     def set_goal(self, x: float, y: float) -> None:
+        """Set single goal or start of multi-waypoint mission."""
         with self.lock:
             self.state.mode = "mission"
             nav = self.state.nav
@@ -236,19 +162,33 @@ class RobotRuntime:
             nav.status = "planning"
             nav.path = []
             nav.current_target = None
-            nav.last_plan_time = 0.0
-            self._obstacle_blocked_at = 0.0
-            self._obstacle_reverse_until = 0.0
-            self._replanning_after_obs = False
-            self._current_trajectory = []
-            self._current_smoothed_path = SmoothedPath()
-            self._path_valid = False
-            self._trajectory_tracker.reset()
+            self._obstacle_detected_at = 0.0
+            self._is_obstacle_stable = False
+            self._mission_waypoints = [(float(x), float(y))]
+            self._current_waypoint_idx = 0
 
-        try:
-            self._planner_request_queue.put_nowait((time.time(), (x, y)))
-        except queue.Full:
-            log.warning("Planner queue full, dropping request")
+    def add_waypoint(self, x: float, y: float) -> None:
+        """Add waypoint to current mission queue."""
+        with self.lock:
+            self._mission_waypoints.append((float(x), float(y)))
+
+    def set_mission_waypoints(self, waypoints: List[Tuple[float, float]]) -> None:
+        """Set entire mission waypoints: [(x1,y1), (x2,y2), (x3,y3), ...]"""
+        if not waypoints:
+            return
+        with self.lock:
+            self.state.mode = "mission"
+            nav = self.state.nav
+            nav.active = True
+            nav.goal = waypoints[0]
+            nav.status = "planning"
+            nav.path = []
+            nav.current_target = None
+            self._mission_waypoints = list(waypoints)
+            self._current_waypoint_idx = 0
+            self._obstacle_detected_at = 0.0
+            self._is_obstacle_stable = False
+        log.info("Mission set with %d waypoints", len(waypoints))
 
     def cancel_navigation(self) -> None:
         with self.lock:
@@ -263,11 +203,8 @@ class RobotRuntime:
         nav.status = "idle"
         self.state.linear_cmd = 0.0
         self.state.angular_cmd = 0.0
-        self._current_linear = 0.0
-        self._current_angular = 0.0
-        self._current_trajectory = []
-        self._current_smoothed_path = SmoothedPath()
-        self._path_valid = False
+        self._mission_waypoints = []
+        self._current_waypoint_idx = 0
         self.queue.push_stop()
 
     def start_mapping(self, clear: bool = False) -> None:
@@ -285,10 +222,6 @@ class RobotRuntime:
             self.map.clear()
             self.state.nav.path = []
         self.localizer.reset()
-        self._planner.update_static_map(self.map.occupancy_for_planner())
-        self._replanning_after_obs = False
-        self._obstacle_blocked_at = 0.0
-        self._obstacle_reverse_until = 0.0
 
     def save_map(self, name: str) -> dict:
         return self.map.save(name)
@@ -296,7 +229,6 @@ class RobotRuntime:
     def load_map(self, name: str) -> None:
         self.map.load(name)
         self.localizer.reset()
-        self._planner.update_static_map(self.map.occupancy_for_planner())
 
     def set_pose(self, x: float, y: float, theta: float) -> None:
         with self.lock:
@@ -304,13 +236,8 @@ class RobotRuntime:
             self.bridge.reset_odometry()
             self._last_ticks = None
             self._last_tel_ts = None
-            self.state.nav.status = "start pose updated"
+            self.state.nav.status = "pose set"
         self.localizer.reset()
-        self._replanning_after_obs = False
-        self._obstacle_blocked_at = 0.0
-        self._obstacle_reverse_until = 0.0
-        self._current_trajectory = []
-        self._path_valid = False
 
     def poi_add(self, label: str, kind: str, x: float, y: float, note: str = "") -> dict:
         return self.poi.add(label, kind, x, y, note)
@@ -337,9 +264,13 @@ class RobotRuntime:
             self.state.latest_scan_points = len(self.lidar.get_scan())
             self.state.last_error = self.bridge.last_error or self.state.last_error
             s = self.state.to_dict()
-        if self._obstacle_blocked_at > 0:
-            elapsed = time.time() - self._obstacle_blocked_at
-            remaining = max(0.0, rtcfg.get("obstacle_wait_before_replan_s") - elapsed)
+            s["mission_waypoints"] = len(self._mission_waypoints)
+            s["current_waypoint"] = self._current_waypoint_idx + 1
+            s["waypoint_total"] = len(self._mission_waypoints)
+        if self._obstacle_detected_at > 0:
+            elapsed = time.time() - self._obstacle_detected_at
+            wait_s = rtcfg.get("obstacle_wait_before_replan_s")
+            remaining = max(0.0, wait_s - elapsed)
             s["obstacle_wait_remaining_s"] = round(remaining, 1)
         else:
             s["obstacle_wait_remaining_s"] = None
@@ -348,50 +279,13 @@ class RobotRuntime:
     def get_lidar_payload(self) -> dict:
         with self.lock:
             points = self.lidar.scan_cartesian(config.LIDAR_RENDER_MAX_POINTS)
-            avoidance_route = self._compute_avoidance_route(self.lidar.get_scan())
             return {
                 "connected": self.lidar.connected,
                 "error": self.lidar.error,
                 "points": points,
                 "obstacle_stop": self.state.obstacle_stop,
                 "max_range": config.LIDAR_MAX_RANGE_M,
-                "avoidance_route": avoidance_route,
             }
-
-    def _compute_avoidance_route(self, scan) -> list:
-        if not scan or not self.state.obstacle_stop:
-            return []
-        cone = math.radians(40)
-        nearest_dist = config.LIDAR_MAX_RANGE_M
-        nearest_angle = 0.0
-        for angle, dist in scan:
-            if dist <= 0:
-                continue
-            norm_angle = math.atan2(math.sin(angle), math.cos(angle))
-            if abs(norm_angle) < cone and dist < rtcfg.get("obstacle_stop_distance_m") * 3.0:
-                if dist < nearest_dist:
-                    nearest_dist = dist
-                    nearest_angle = norm_angle
-        if nearest_dist >= config.LIDAR_MAX_RANGE_M:
-            return []
-        obs_x = nearest_dist * math.cos(nearest_angle)
-        obs_y = nearest_dist * math.sin(nearest_angle)
-        left_pts = [d for a, d in scan if 0.25 < math.atan2(math.sin(a), math.cos(a)) < 1.57]
-        right_pts = [d for a, d in scan if -1.57 < math.atan2(math.sin(a), math.cos(a)) < -0.25]
-        left_clear = min(left_pts, default=config.LIDAR_MAX_RANGE_M)
-        right_clear = min(right_pts, default=config.LIDAR_MAX_RANGE_M)
-        side = 1.0 if left_clear >= right_clear else -1.0
-        side_label = "left" if side > 0 else "right"
-        detour_y = side * max(0.40, nearest_dist * 0.60)
-        clear_dist = left_clear if side > 0 else right_clear
-        wp1 = {"x": round(max(0.05, obs_x * 0.20), 3), "y": round(detour_y, 3)}
-        wp2 = {"x": round(obs_x + 0.20, 3), "y": round(detour_y, 3)}
-        wp3 = {"x": round(obs_x + 0.45, 3), "y": 0.0}
-        return [
-            {"side": side_label, "clear_m": round(clear_dist, 2), **wp1},
-            wp2,
-            wp3,
-        ]
 
     def get_map_payload(self) -> dict:
         with self.lock:
@@ -426,55 +320,8 @@ class RobotRuntime:
                 out.append({"x": gx, "y": gy})
         return out
 
-    def _planner_loop(self) -> None:
-        """Background planner worker thread."""
-        log.info("Planner worker started")
-        while self._running:
-            try:
-                request_time, goal = self._planner_request_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            try:
-                start = (self.state.pose.x, self.state.pose.y)
-                raw_path = self._planner.plan(
-                    start=start,
-                    goal=goal,
-                    grid_origin=(config.MAP_ORIGIN_X_M, config.MAP_ORIGIN_Y_M),
-                    use_jps=True,
-                )
-
-                if raw_path and len(raw_path) >= 2:
-                    smoothed = self._path_smoother.smooth(raw_path)
-                    TrajectoryTracker._trajectory_cache = smoothed.points
-                    path_for_state = [(pt.x, pt.y) for pt in smoothed.points]
-
-                    with self.lock:
-                        self._current_smoothed_path = smoothed
-                        self._current_trajectory = smoothed.points
-                        self._planner_result = path_for_state
-                        self._path_valid = True
-                        self.state.nav.path = path_for_state
-                        self.state.nav.status = "following path"
-                        self.state.nav.last_plan_time = time.time()
-                else:
-                    with self.lock:
-                        self._current_trajectory = []
-                        self._current_smoothed_path = SmoothedPath()
-                        self._planner_result = []
-                        self._path_valid = False
-                        self.state.nav.path = []
-                        self.state.nav.status = "no path found"
-
-            except Exception as exc:
-                log.exception("Planner error: %s", exc)
-                with self.lock:
-                    self.state.nav.status = f"planner error: {exc}"
-
-        log.info("Planner worker stopped")
-
     def _ctrl_loop(self) -> None:
-        """Main 50 Hz control loop."""
+        """Main 20 Hz control loop - simple and robust."""
         import queue as _queue
         _map_q: "_queue.Queue[tuple]" = _queue.Queue(maxsize=2)
 
@@ -483,7 +330,6 @@ class RobotRuntime:
                 try:
                     pose_snap, scan_snap = _map_q.get(timeout=0.2)
                     self.map.update_from_scan(pose_snap, scan_snap)
-                    self.map_renderer.update_map(self.map.log_odds)
                 except _queue.Empty:
                     pass
                 except Exception as exc:
@@ -494,35 +340,23 @@ class RobotRuntime:
 
         next_tick = time.perf_counter()
         while self._running:
-            t0 = time.perf_counter()
             try:
                 with self.lock:
                     scan = self.lidar.get_scan()
                     self.state.lidar_connected = self.lidar.connected
                     self.state.latest_scan_points = len(scan)
-                    self._update_odometry()
-                    pose_snap = (self.state.pose.x, self.state.pose.y, self.state.pose.theta)
 
-                if config.LIDAR_LOCALIZATION_ENABLED and scan:
-                    corrected = self.localizer.correct(self.state.pose, scan)
-                    with self.lock:
-                        self.state.pose.x = corrected.x
-                        self.state.pose.y = corrected.y
-                        self.state.pose.theta = corrected.theta
-                        pose_snap = (corrected.x, corrected.y, corrected.theta)
+                    self._update_odometry_with_icp(scan)
 
-                with self.lock:
-                    do_map = self.state.mapping
-                if do_map and scan:
-                    from app.robot.state import Pose as _Pose
-                    p = _Pose(*pose_snap)
-                    try:
-                        _map_q.put_nowait((p, scan))
-                    except _queue.Full:
-                        pass
+                    if self.state.mapping and scan:
+                        from app.robot.state import Pose as _Pose
+                        p = self.state.pose
+                        try:
+                            _map_q.put_nowait((p, scan))
+                        except _queue.Full:
+                            pass
 
-                with self.lock:
-                    self.state.obstacle_stop = self._obstacle_in_cone(scan)
+                    self.state.obstacle_stop = self._check_obstacle(scan)
                     mode = self.state.mode
                     nav_active = self.state.nav.active
 
@@ -539,7 +373,21 @@ class RobotRuntime:
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
+    def _update_odometry_with_icp(self, scan: List[Tuple[float, float]]) -> None:
+        """Update pose using odometry + LiDAR ICP fusion."""
+        self._update_odometry()
+
+        if config.LIDAR_LOCALIZATION_ENABLED and scan and len(scan) > 20:
+            corrected = self.localizer.correct(self.state.pose, scan)
+            icp_weight = rtcfg.get("lidar_icp_weight")
+            self.state.pose.x = self.state.pose.x * (1 - icp_weight) + corrected.x * icp_weight
+            self.state.pose.y = self.state.pose.y * (1 - icp_weight) + corrected.y * icp_weight
+            self.state.pose.theta = wrap_angle(
+                self.state.pose.theta * (1 - icp_weight) + corrected.theta * icp_weight
+            )
+
     def _update_odometry(self) -> None:
+        """Pure odometry from wheel encoders."""
         ticks = (self.state.left_ticks, self.state.right_ticks)
         now = self.state.last_update
         if self._last_ticks is None:
@@ -563,9 +411,9 @@ class RobotRuntime:
         self.state.pose.y += ds * math.sin(mid)
         self.state.pose.theta = wrap_angle(self.state.pose.theta + dtheta)
 
-    def _obstacle_in_cone(self, scan: List[Tuple[float, float]]) -> bool:
-        cone_deg = rtcfg.get("obstacle_detection_cone_deg")
-        cone = math.radians(cone_deg)
+    def _check_obstacle(self, scan: List[Tuple[float, float]]) -> bool:
+        """Check if obstacle in front."""
+        cone = math.radians(30)
         stop_dist = rtcfg.get("obstacle_stop_distance_m")
         for angle, dist in scan:
             if abs(angle) < cone and 0 < dist < stop_dist:
@@ -581,7 +429,7 @@ class RobotRuntime:
             self.queue.push_stop()
 
     def _nav_step(self, scan: List[Tuple[float, float]]) -> None:
-        """Advanced navigation with smooth trajectory following."""
+        """Simple waypoint following navigation."""
         if not self.state.armed:
             self.queue.push_stop()
             self.state.nav.status = "waiting for arm"
@@ -595,134 +443,139 @@ class RobotRuntime:
         dist_to_goal = math.hypot(
             goal[0] - self.state.pose.x, goal[1] - self.state.pose.y
         )
+
         if dist_to_goal <= config.GOAL_TOLERANCE_M:
             self.queue.push_stop()
-            self.state.nav.status = "goal reached"
-            self.state.nav.active = False
-            self.state.nav.path = []
-            self.state.nav.current_target = None
-            self.state.linear_cmd = 0.0
-            self.state.angular_cmd = 0.0
-            self._current_linear = 0.0
-            self._current_angular = 0.0
-            self._obstacle_blocked_at = 0.0
-            self._obstacle_reverse_until = 0.0
-            self._replanning_after_obs = False
+            self._advance_to_next_waypoint()
             return
 
         now = time.time()
+        obstacle_wait = rtcfg.get("obstacle_wait_before_replan_s")
 
-        if self.state.obstacle_stop and not self._replanning_after_obs:
-            if self._obstacle_blocked_at == 0.0:
-                self._obstacle_blocked_at = now
-                log.info("Obstacle detected — waiting %.0f s before replanning",
-                         rtcfg.get("obstacle_wait_before_replan_s"))
+        if self.state.obstacle_stop:
+            if self._obstacle_detected_at == 0.0:
+                self._obstacle_detected_at = now
+                log.info("Obstacle detected - waiting %.0f s", obstacle_wait)
+                self.queue.push_stop()
 
-            elapsed = now - self._obstacle_blocked_at
-            wait_s = rtcfg.get("obstacle_wait_before_replan_s")
+            elapsed = now - self._obstacle_detected_at
+            remaining = obstacle_wait - elapsed
 
-            if elapsed < wait_s:
-                self._smooth_velocity(0.0, 0.0, _CONTROL_DT)
-                lp, rp = self._cmd_to_pwm(self._current_linear, self._current_angular)
-                self.queue.push_nav(lp, rp)
-                remaining = wait_s - elapsed
-                self.state.nav.status = f"obstacle: waiting {remaining:.0f} s"
+            if elapsed < obstacle_wait:
+                self.state.nav.status = f"obstacle: waiting {remaining:.0f}s"
                 return
 
-            if self._obstacle_reverse_until == 0.0:
-                self._obstacle_reverse_until = now + rtcfg.get("obstacle_replan_reverse_s")
-                log.info("Obstacle still present after %.0f s — reversing %.1f s",
-                         wait_s, rtcfg.get("obstacle_replan_reverse_s"))
-
-            if now < self._obstacle_reverse_until:
-                self._smooth_velocity(config.OBSTACLE_REVERSE_SPEED, 0.0, _CONTROL_DT)
-                lp, rp = self._cmd_to_pwm(self._current_linear, self._current_angular)
-                self.queue.push_nav(lp, rp)
-                self.state.nav.status = "obstacle: reversing to replan"
-                return
-
-            log.info("Reverse done — replanning around transient obstacle")
-            self._obstacle_blocked_at = 0.0
-            self._obstacle_reverse_until = 0.0
-            self._replanning_after_obs = True
+            log.info("Obstacle stable for %.0f s - replanning", obstacle_wait)
+            self._obstacle_detected_at = 0.0
             self.state.nav.last_plan_time = 0.0
             self.state.nav.path = []
-            self._current_trajectory = []
-            self._path_valid = False
-            self.state.nav.status = "replanning around obstacle"
 
-            try:
-                self._planner_request_queue.put_nowait((now, goal))
-            except queue.Full:
-                pass
+        if not self.state.nav.path or (now - self.state.nav.last_plan_time) > rtcfg.get("nav_replan_seconds"):
+            self._plan_path(scan)
+
+        if not self.state.nav.path:
+            self.state.nav.status = "no path found"
+            self.queue.push_stop()
             return
 
-        if self._obstacle_blocked_at != 0.0:
-            elapsed = now - self._obstacle_blocked_at
-            log.info("Obstacle cleared after %.1f s — resuming path", elapsed)
-            self._obstacle_blocked_at = 0.0
-            self._obstacle_reverse_until = 0.0
-            self._replanning_after_obs = False
+        self._follow_path()
+
+    def _advance_to_next_waypoint(self) -> None:
+        """Move to next waypoint in mission or complete mission."""
+        if self._current_waypoint_idx < len(self._mission_waypoints) - 1:
+            self._current_waypoint_idx += 1
+            next_wp = self._mission_waypoints[self._current_waypoint_idx]
+            self.state.nav.goal = next_wp
+            self.state.nav.path = []
             self.state.nav.last_plan_time = 0.0
-            self._path_valid = False
+            self.state.nav.status = f"waypoint {self._current_waypoint_idx + 1}/{len(self._mission_waypoints)}"
+            log.info("Advancing to waypoint %d/%d: (%.2f, %.2f)",
+                     self._current_waypoint_idx + 1, len(self._mission_waypoints),
+                     next_wp[0], next_wp[1])
+        else:
+            self.state.nav.status = "mission complete"
+            self.state.nav.active = False
+            self.state.nav.goal = None
+            log.info("Mission complete!")
 
-        should_plan = (
-            not self._path_valid
-            or self._replanning_after_obs
-            or (now - self.state.nav.last_plan_time) > rtcfg.get("nav_replan_seconds")
-        )
-        if should_plan and not self._replanning_after_obs:
-            try:
-                self._planner_request_queue.put_nowait((now, goal))
-            except queue.Full:
-                pass
+    def _plan_path(self, scan: Optional[List[Tuple[float, float]]] = None) -> None:
+        """Simple A* path planning."""
+        goal = self.state.nav.goal
+        if goal is None:
+            return
 
-        self._trajectory_tracker.set_trajectory(self._current_trajectory)
+        occ = self.map.occupancy_for_planner()
+        if scan:
+            occ = self.map.overlay_scan_on_occupancy(self.state.pose, scan, occupancy=occ)
 
-        pose = (self.state.pose.x, self.state.pose.y, self.state.pose.theta)
-        linear_raw, angular_raw = self._trajectory_tracker.compute_cmd(
-            pose=pose,
-            trajectory=self._current_trajectory,
-            current_velocity=self._current_linear,
-            dt=_CONTROL_DT,
-        )
+        occ_inf = inflate_occupancy(occ, config.PLANNER_INFLATION_CELLS)
 
-        self._smooth_velocity(linear_raw, angular_raw, _CONTROL_DT)
+        start_raw = self.map.world_to_grid(self.state.pose.x, self.state.pose.y)
+        goal_raw = self.map.world_to_grid(goal[0], goal[1])
 
-        self.state.linear_cmd = self._current_linear
-        self.state.angular_cmd = self._current_angular
-        self.state.nav.status = "following path"
+        start = nearest_free_cell(occ_inf, start_raw, radius=8)
+        goal_cell = nearest_free_cell(occ_inf, goal_raw, radius=8)
 
-        lp, rp = self._cmd_to_pwm(self._current_linear, self._current_angular)
+        if start is None or goal_cell is None:
+            log.warning("No free cell found near start or goal")
+            return
+
+        cells = astar(occ_inf, start, goal_cell)
+        if not cells:
+            log.warning("No path found")
+            return
+
+        world_path = [self.map.grid_to_world(x, y) for x, y in cells]
+        self.state.nav.path = simplify_path(world_path, spacing=0.15)
+        self.state.nav.last_plan_time = time.time()
+        log.info("Path planned with %d points", len(self.state.nav.path))
+
+    def _follow_path(self) -> None:
+        """Simple direct path following."""
+        path = list(self.state.nav.path)
+        if not path:
+            return
+
+        pose = self.state.pose
+
+        while len(path) > 1:
+            dist = math.hypot(path[0][0] - pose.x, path[0][1] - pose.y)
+            if dist < config.WAYPOINT_REACHED_M:
+                path.pop(0)
+            else:
+                break
+
+        if not path:
+            return
+
+        target = path[0]
+        self.state.nav.current_target = target
+
+        dx = target[0] - pose.x
+        dy = target[1] - pose.y
+        target_angle = math.atan2(dy, dx)
+
+        angle_diff = wrap_angle(target_angle - pose.theta)
+
+        linear = config.MAX_LINEAR_MPS * 0.7
+        angular = config.NAV_ANGULAR_GAIN * angle_diff
+
+        angular = max(-config.MAX_ANGULAR_RADPS, min(config.MAX_ANGULAR_RADPS, angular))
+
+        if abs(angle_diff) > config.ROTATE_IN_PLACE_THRESHOLD_RAD:
+            linear *= 0.3
+
+        self.state.linear_cmd = linear / config.MAX_LINEAR_MPS
+        self.state.angular_cmd = angular / config.MAX_ANGULAR_RADPS
+
+        lp, rp = self._cmd_to_pwm(linear / config.MAX_LINEAR_MPS, angular / config.MAX_ANGULAR_RADPS)
         self.queue.push_nav(lp, rp)
 
-    def _smooth_velocity(
-        self,
-        target_linear: float,
-        target_angular: float,
-        dt: float,
-    ) -> None:
-        """Apply smooth velocity limiting for gradual acceleration/deceleration."""
-        max_linear_accel = rtcfg.get("nav_max_acceleration")
-        max_angular_accel = rtcfg.get("nav_max_angular_accel")
-
-        linear_diff = target_linear - self._current_linear
-        angular_diff = target_angular - self._current_angular
-
-        max_linear_change = max_linear_accel * dt
-        max_angular_change = max_angular_accel * dt
-
-        if abs(linear_diff) > max_linear_change:
-            linear_diff = math.copysign(max_linear_change, linear_diff)
-        if abs(angular_diff) > max_angular_change:
-            angular_diff = math.copysign(max_angular_change, angular_diff)
-
-        self._current_linear += linear_diff
-        self._current_angular += angular_diff
+        self.state.nav.status = "following path"
 
     def _cmd_to_pwm(self, linear: float, angular: float) -> Tuple[int, int]:
         """Convert normalized commands to PWM values."""
-        lmps = linear * rtcfg.get("max_linear_mps")
+        lmps = linear * config.MAX_LINEAR_MPS
         rads = angular * config.MAX_ANGULAR_RADPS
         lw = lmps - 0.5 * config.WHEEL_BASE_M * rads
         rw = lmps + 0.5 * config.WHEEL_BASE_M * rads
@@ -730,39 +583,11 @@ class RobotRuntime:
         if max_speed == 0:
             return 0, 0
         scale = config.MAX_PWM / max_speed
-        left_pwm = max(-config.MAX_PWM, min(config.MAX_PWM, int(lw * scale)))
-        right_pwm = max(-config.MAX_PWM, min(config.MAX_PWM, int(rw * scale)))
+        left_pwm_raw = int(lw * scale)
+        right_pwm_raw = int(rw * scale)
+        left_pwm = max(-config.MAX_PWM, min(config.MAX_PWM, left_pwm_raw))
+        right_pwm = max(-config.MAX_PWM, min(config.MAX_PWM, right_pwm_raw))
         return left_pwm, right_pwm
-
-    def _map_push_loop(self) -> None:
-        """Push map updates via Socket.IO."""
-        _last_png_gen: int = -1
-
-        while self._running:
-            self._map_pusher_event.wait(timeout=0.10)
-            self._map_pusher_event.clear()
-
-            if not self._running:
-                break
-
-            try:
-                with self.lock:
-                    scan_px = self._scan_to_map_pixels(self.lidar.get_scan())
-                    current_gen = self.map._scan_gen
-
-                payload = self.get_map_payload()
-
-                if current_gen == _last_png_gen and payload.get("image_png_b64"):
-                    payload.pop("image_png_b64", None)
-                else:
-                    _last_png_gen = current_gen
-
-                if self._socketio:
-                    self._socketio.emit("map_update", payload)
-
-                self._last_map_push = time.time()
-            except Exception as exc:
-                log.debug("Map push error: %s", exc)
 
     def _monitor_loop(self) -> None:
         """Monitor loop for connectivity and heartbeat."""
@@ -782,9 +607,6 @@ class RobotRuntime:
             hb_age = time.time() - self._last_heartbeat
             if hb_age > config.HEARTBEAT_TIMEOUT_S:
                 if self.state.armed:
-                    log.warning("Heartbeat lost (%.1f s) — sending stop", hb_age)
+                    log.warning("Heartbeat lost - sending stop")
                     self.queue.push_stop()
-                    with self.lock:
-                        if self.state.nav.active:
-                            self._cancel_nav_locked()
             time.sleep(0.25)

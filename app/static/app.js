@@ -26,7 +26,7 @@ const STATE = {
   mapDragging: false, _dragLastX: 0, _dragLastY: 0, _dragLastT: 0,
   _pinchDist: null, _pinchMidX: 0, _pinchMidY: 0,
   _pointerMoved: false, _pointerDownX: 0, _pointerDownY: 0,
-  pendingPoi: null, pendingGoal: null, mapCentered: false, dragStart: null,
+  pendingPoi: null, pendingGoal: null, missionWaypoints: [], mapCentered: false, dragStart: null,
   _pois: [],
   _staticImg: null, _staticImgSrc: '', _loadingImgSrc: '', _renderPending: false,
 };
@@ -223,12 +223,19 @@ EL.loadMapBtn.addEventListener('click', () => {
   if (name) api('/api/map/load','POST',{name}).then(()=>refreshMap()).catch(()=>{});
 });
 EL.startMissionBtn.addEventListener('click', () => {
-  if (!STATE.pendingGoal) { alert('Place a goal on the map first.'); return; }
-  api('/api/navigate/goal','POST',{x:STATE.pendingGoal.x, y:STATE.pendingGoal.y}).catch(()=>{});
+  if (STATE.missionWaypoints.length === 0 && !STATE.pendingGoal) {
+    alert('Place at least one waypoint on the map first.\nRight-click to add more waypoints.'); return;
+  }
+  const waypoints = STATE.missionWaypoints.length > 0 ? STATE.missionWaypoints : [[STATE.pendingGoal.x, STATE.pendingGoal.y]];
+  api('/api/navigate/mission','POST',{waypoints}).then(() => {
+    STATE.pendingGoal = null;
+    STATE.missionWaypoints = [];
+    scheduleMapRender();
+  }).catch(() => {});
 });
 EL.cancelNavBtn.addEventListener('click', () => {
   api('/api/navigate/cancel','POST',{}).catch(()=>{});
-  STATE.pendingGoal=null; scheduleMapRender();
+  STATE.pendingGoal=null; STATE.missionWaypoints=[]; scheduleMapRender();
 });
 
 /* ── Google-Maps zoom/pan ────────────────────────────────────────────────── */
@@ -352,7 +359,14 @@ EL.mapCanvas.addEventListener('pointerup', e => {
   if (STATE.mapMeta) {
     const pt = canvasToWorld(e.clientX, e.clientY);
     if (STATE.mapTool === 'goal') {
-      STATE.pendingGoal = {x: pt.x, y: pt.y};
+      // Shift+click adds to waypoints, regular click replaces
+      if (e.shiftKey) {
+        STATE.missionWaypoints.push([pt.x, pt.y]);
+        console.log('Waypoint added:', pt.x.toFixed(2), pt.y.toFixed(2), 'Total:', STATE.missionWaypoints.length);
+      } else {
+        STATE.pendingGoal = {x: pt.x, y: pt.y};
+        STATE.missionWaypoints.push([pt.x, pt.y]);
+      }
       scheduleMapRender();
     } else if (STATE.mapTool === 'start') {
       const start = STATE.dragStart || pt;
@@ -362,6 +376,16 @@ EL.mapCanvas.addEventListener('pointerup', e => {
     }
   }
   STATE.dragStart = null;
+});
+
+// Right-click to add waypoint quickly
+EL.mapCanvas.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  if (!STATE.mapMeta) return;
+  const pt = canvasToWorld(e.clientX, e.clientY);
+  STATE.pendingGoal = {x: pt.x, y: pt.y};
+  STATE.missionWaypoints.push([pt.x, pt.y]);
+  scheduleMapRender();
 });
 
 EL.mapCanvas.addEventListener('pointercancel', e => {
@@ -580,7 +604,9 @@ function applyStatus(s) {
   if (s.obstacle_stop && rem>0) { setText('st-safety',`⏳ ${rem.toFixed(0)} s`); _setObstacleCountdown(rem,5.0); }
   else if (s.obstacle_stop)     { setText('st-safety','BLOCKED'); _clearObstacleCountdown(); }
   else                          { setText('st-safety','CLEAR');   _clearObstacleCountdown(); }
-  const navSt = s.nav?.status||'--'; setText('st-nav', navSt);
+  const navSt = s.nav?.status||'--';
+  const wpInfo = s.waypoint_total > 0 ? ` [${s.current_waypoint}/${s.waypoint_total}]` : '';
+  setText('st-nav', navSt + wpInfo);
   const navEl = document.getElementById('st-nav');
   if (navEl) navEl.style.color = navSt.includes('waiting')?'#fbbf24':navSt.includes('replan')?'#f87171':navSt.includes('reached')?'#34d399':'';
   EL.icpPill.className = s.lidar_connected ? 'pill good' : 'pill dim';
@@ -697,39 +723,51 @@ function renderMapFrame() {
     meta.scan.forEach(p=>mapCtx.fillRect(p.x-dot/2,p.y-dot/2,dot,dot));
   }
 
-  // Path with velocity-based color gradient (v7: smooth trajectory visualization)
+  // Path (simplified)
   if (meta.path?.length>1) {
     mapCtx.save();
+    mapCtx.strokeStyle='#38bdf8';
+    mapCtx.lineWidth=2*invZ;
+    mapCtx.shadowColor='rgba(56,189,248,0.5)';
+    mapCtx.shadowBlur=6*invZ;
     mapCtx.lineCap='round';
-    mapCtx.lineJoin='round';
+    mapCtx.beginPath();
+    meta.path.forEach((p,i)=>i===0?mapCtx.moveTo(p.x,p.y):mapCtx.lineTo(p.x,p.y));
+    mapCtx.stroke();
+    mapCtx.restore();
+  }
 
-    const pathLen=meta.path.length;
-    for(let i=1;i<pathLen;i++){
-      const p0=meta.path[i-1], p1=meta.path[i];
-      const t=i/pathLen;
-      const r=Math.round(56*(1-t)+56*t);
-      const g=Math.round(189*(1-t)+100*t);
-      const b=Math.round(248*(1-t)+71*t);
-      mapCtx.strokeStyle=`rgba(${r},${g},${b},0.9)`;
-      mapCtx.lineWidth=(1.5+1.5*((1-t)*0.8+0.2))*invZ;
-      mapCtx.shadowColor=`rgba(${r},${g},${b},0.4)`;
-      mapCtx.shadowBlur=4*invZ;
+  // Mission waypoints (numbered)
+  if (STATE.missionWaypoints.length > 0) {
+    mapCtx.save();
+    STATE.missionWaypoints.forEach((wp, idx) => {
+      const gx=(wp[0]-meta.origin[0])/meta.resolution;
+      const gy=(wp[1]-meta.origin[1])/meta.resolution;
+      const isLast = idx === STATE.missionWaypoints.length - 1;
+      mapCtx.fillStyle = isLast ? '#60a5fa' : '#34d399';
+      mapCtx.shadowColor = mapCtx.fillStyle;
+      mapCtx.shadowBlur = 8*invZ;
       mapCtx.beginPath();
-      mapCtx.moveTo(p0.x,p0.y);
-      mapCtx.lineTo(p1.x,p1.y);
-      mapCtx.stroke();
-    }
-
-    // Draw lookahead point indicator
-    if(meta.path?.length>3){
-      const idx=Math.floor(pathLen*0.3);
-      const lp=meta.path[idx];
-      mapCtx.fillStyle='rgba(251,191,36,0.8)';
-      mapCtx.shadowColor='#fbbf24';
-      mapCtx.shadowBlur=8*invZ;
-      mapCtx.beginPath();
-      mapCtx.arc(lp.x,lp.y,3*invZ,0,Math.PI*2);
+      mapCtx.arc(gx, gy, (isLast ? 6 : 5)*invZ, 0, Math.PI*2);
       mapCtx.fill();
+      mapCtx.fillStyle='#fff';
+      mapCtx.font=`bold ${10*invZ}px sans-serif`;
+      mapCtx.textAlign='center';
+      mapCtx.textBaseline='middle';
+      mapCtx.fillText(idx+1, gx, gy);
+    });
+    // Draw connecting lines
+    if (STATE.missionWaypoints.length > 1) {
+      mapCtx.strokeStyle='rgba(52,211,153,0.5)';
+      mapCtx.lineWidth=1.5*invZ;
+      mapCtx.setLineDash([4*invZ, 4*invZ]);
+      mapCtx.beginPath();
+      STATE.missionWaypoints.forEach((wp, idx) => {
+        const gx=(wp[0]-meta.origin[0])/meta.resolution;
+        const gy=(wp[1]-meta.origin[1])/meta.resolution;
+        idx===0?mapCtx.moveTo(gx,gy):mapCtx.lineTo(gx,gy);
+      });
+      mapCtx.stroke();
     }
     mapCtx.restore();
   }

@@ -1,13 +1,12 @@
-"""Arespath Rover — main Flask application v7.
+"""Arespath Rover — main Flask application v8.
 
-V7 Navigation Stack (ROS-inspired):
+Simplified Mission Control Stack:
 ─────────────────────────────────────
-• Sensor Processing: LiDAR + radar fusion
-• Localization: ICP-corrected odometry
-• Global Planner: Jump Point Search (JPS) with dynamic obstacles
-• Local Planner: Cubic spline smoothing + velocity profiling
-• Controller: Pure pursuit + PID heading control
-• Motor Control: Smooth velocity with acceleration limiting
+• Sensor Fusion: Telemetry (odometry) + LiDAR ICP correction
+• Simple A* path planner
+• Direct waypoint following
+• Multi-waypoint mission support (x1,y1 → x2,y2 → x3,y3)
+• Stable obstacle detection (5 sec wait before replan)
 
 Routes
 ──────
@@ -182,6 +181,36 @@ def api_nav_goal():
 @app.route("/api/navigate/cancel", methods=["POST"])
 def api_nav_cancel():
     runtime.cancel_navigation()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/navigate/mission", methods=["POST"])
+def api_nav_mission():
+    """Set multi-waypoint mission: {"waypoints": [[x1,y1], [x2,y2], [x3,y3], ...]}"""
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "JSON body required"}), 400
+    waypoints = request.json.get("waypoints", [])
+    if not waypoints:
+        return jsonify({"ok": False, "error": "waypoints array required"}), 400
+    try:
+        wp_list = [(float(wp[0]), float(wp[1])) for wp in waypoints]
+    except (TypeError, ValueError, IndexError) as exc:
+        return jsonify({"ok": False, "error": f"Invalid waypoint format: {exc}"}), 400
+    runtime.set_mission_waypoints(wp_list)
+    return jsonify({"ok": True, "waypoints": len(wp_list), "start": wp_list[0]})
+
+
+@app.route("/api/navigate/add_waypoint", methods=["POST"])
+def api_nav_add_waypoint():
+    """Add waypoint to current mission."""
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "JSON body required"}), 400
+    try:
+        x = float(request.json["x"])
+        y = float(request.json["y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    runtime.add_waypoint(x, y)
     return jsonify({"ok": True})
 
 
