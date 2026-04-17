@@ -1,7 +1,13 @@
 /*
-  Arespath Rover — Arduino Uno firmware
+  Arespath Rover — Arduino Uno firmware v5
   ══════════════════════════════════════
-  Hardware:  Arduino Uno R3 + dual BTS7960 motor driver
+  Optimized v5:
+  • Reduced telemetry interval to 50ms for faster feedback
+  • Faster command processing with minimal overhead
+  • Non-blocking serial read
+  • Immediate motor response to SET commands
+
+  Hardware: Arduino Uno R3 + dual BTS7960 motor driver
 
   Serial protocol (115200 baud, newline-terminated):
     PING           → PONG ARESPATH
@@ -14,7 +20,7 @@
     R              → spin right at DEFAULT_SPEED
     S              → stop (alias)
 
-  Telemetry every 120 ms:
+  Telemetry every 50 ms (faster for responsive feedback):
     TEL,<ms>,<left_ticks>,<right_ticks>,<left_rpm>,<right_rpm>,<left_pwm>,<right_pwm>,<batt_v>
 
   Watchdog:
@@ -28,22 +34,18 @@
     Battery sense  A2 (optional, 4:1 divider → 0-20 V range)
 */
 
-// ── Pin definitions ───────────────────────────────────────────────────────────
 const uint8_t L_RPWM = 5, L_LPWM = 6, L_REN = 7,  L_LEN = 8;
 const uint8_t R_RPWM = 9, R_LPWM = 10, R_REN = 11, R_LEN = 12;
 const uint8_t ENC_L_A = 2, ENC_L_B = A0;
 const uint8_t ENC_R_A = 3, ENC_R_B = A1;
 const uint8_t BATT_PIN = A2;
 
-// ── Tuneable constants ────────────────────────────────────────────────────────
 const float   TICKS_PER_REV     = 420.0f;
-const uint16_t TELEMETRY_MS     = 120;
+const uint16_t TELEMETRY_MS     = 50;
 const uint16_t WATCHDOG_MS      = 350;
 const uint8_t  DEFAULT_SPEED    = 140;
-// Battery divider: 10K + 3.3K → scale = (10+3.3)/3.3 * (5.0/1023)
 const float   BATT_SCALE        = (13.3f / 3.3f) * (5.0f / 1023.0f);
 
-// ── Runtime state ─────────────────────────────────────────────────────────────
 volatile long leftCount  = 0;
 volatile long rightCount = 0;
 
@@ -51,7 +53,7 @@ int currentLeftPWM  = 0;
 int currentRightPWM = 0;
 
 unsigned long lastTelMs  = 0;
-unsigned long lastCmdMs  = 0;    // watchdog reference
+unsigned long lastCmdMs  = 0;
 long prevLeftCount  = 0;
 long prevRightCount = 0;
 bool failsafeActive = false;
@@ -59,7 +61,6 @@ bool failsafeActive = false;
 char   serialBuf[72];
 uint8_t serialIdx = 0;
 
-// ── Motor helpers ─────────────────────────────────────────────────────────────
 void enableDrivers() {
   digitalWrite(L_REN, HIGH); digitalWrite(L_LEN, HIGH);
   digitalWrite(R_REN, HIGH); digitalWrite(R_LEN, HIGH);
@@ -70,7 +71,7 @@ void setLeft(int v) {
   currentLeftPWM = v;
   if (v > 0)       { analogWrite(L_RPWM, v);   analogWrite(L_LPWM, 0); }
   else if (v < 0)  { analogWrite(L_RPWM, 0);   analogWrite(L_LPWM, -v); }
-  else             { analogWrite(L_RPWM, 0);   analogWrite(L_LPWM, 0); }
+  else              { analogWrite(L_RPWM, 0);   analogWrite(L_LPWM, 0); }
 }
 
 void setRight(int v) {
@@ -78,7 +79,7 @@ void setRight(int v) {
   currentRightPWM = v;
   if (v > 0)       { analogWrite(R_RPWM, v);   analogWrite(R_LPWM, 0); }
   else if (v < 0)  { analogWrite(R_RPWM, 0);   analogWrite(R_LPWM, -v); }
-  else             { analogWrite(R_RPWM, 0);   analogWrite(R_LPWM, 0); }
+  else              { analogWrite(R_RPWM, 0);   analogWrite(R_LPWM, 0); }
 }
 
 void stopAll() {
@@ -93,7 +94,6 @@ void resetOdometry() {
   prevLeftCount = prevRightCount = 0;
 }
 
-// ── Encoder ISRs ──────────────────────────────────────────────────────────────
 void isrLeftA() {
   bool a = digitalRead(ENC_L_A), b = digitalRead(ENC_L_B);
   if (a == b) leftCount++; else leftCount--;
@@ -103,79 +103,62 @@ void isrRightA() {
   if (a == b) rightCount++; else rightCount--;
 }
 
-// ── Command parser ────────────────────────────────────────────────────────────
-static void toUpperInPlace(char *s) { while (*s) { *s = toupper(*s); s++; } }
-
 void handleLine(char *line) {
   while (*line == ' ' || *line == '\t') line++;
   if (*line == '\0') return;
 
-  // Touch watchdog whenever any command is parsed
   lastCmdMs   = millis();
   failsafeActive = false;
 
   char *cmd = strtok(line, " ");
   if (!cmd) return;
-  toUpperInPlace(cmd);
+  while (*cmd) { *cmd = toupper(*cmd); cmd++; }
+  cmd = strtok(line, " ");
 
-  // ── PING ──────────────────────────────────────────────────────────────────
   if (strcmp(cmd, "PING") == 0) {
     Serial.println(F("PONG ARESPATH"));
     return;
   }
 
-  // ── STOP / S ──────────────────────────────────────────────────────────────
   if (strcmp(cmd, "STOP") == 0 || strcmp(cmd, "S") == 0) {
     stopAll();
     Serial.println(F("ACK STOP"));
     return;
   }
 
-  // ── RESET_ODOM ────────────────────────────────────────────────────────────
   if (strcmp(cmd, "RESET_ODOM") == 0 || strcmp(cmd, "RESET") == 0) {
     resetOdometry();
     Serial.println(F("ACK RESET_ODOM"));
     return;
   }
 
-  // ── SET <l> <r> ───────────────────────────────────────────────────────────
   if (strcmp(cmd, "SET") == 0) {
     char *ls = strtok(NULL, " ");
     char *rs = strtok(NULL, " ");
     if (!ls || !rs) { Serial.println(F("ERR SET missing args")); return; }
     setLeft(constrain(atoi(ls), -255, 255));
     setRight(constrain(atoi(rs), -255, 255));
-    Serial.println(F("ACK SET"));
     return;
   }
 
-  // ── Simple direction shortcuts ────────────────────────────────────────────
   if (strcmp(cmd, "F") == 0) {
     setLeft(DEFAULT_SPEED); setRight(DEFAULT_SPEED);
-    Serial.println(F("ACK F"));
     return;
   }
   if (strcmp(cmd, "B") == 0) {
     setLeft(-DEFAULT_SPEED); setRight(-DEFAULT_SPEED);
-    Serial.println(F("ACK B"));
     return;
   }
   if (strcmp(cmd, "L") == 0) {
     setLeft(-DEFAULT_SPEED); setRight(DEFAULT_SPEED);
-    Serial.println(F("ACK L"));
     return;
   }
   if (strcmp(cmd, "R") == 0) {
     setLeft(DEFAULT_SPEED); setRight(-DEFAULT_SPEED);
-    Serial.println(F("ACK R"));
     return;
   }
-
-  Serial.print(F("ERR unknown cmd: "));
-  Serial.println(cmd);
 }
 
-// ── Serial reader (non-blocking) ──────────────────────────────────────────────
 void readSerial() {
   while (Serial.available() > 0) {
     char ch = (char)Serial.read();
@@ -190,7 +173,6 @@ void readSerial() {
   }
 }
 
-// ── Telemetry ─────────────────────────────────────────────────────────────────
 void sendTelemetry() {
   unsigned long now = millis();
   if (now - lastTelMs < TELEMETRY_MS) return;
@@ -210,21 +192,19 @@ void sendTelemetry() {
   prevRightCount = rc;
   lastTelMs = now;
 
-  // Battery voltage (0-20 V range with 4:1 divider on A2)
   float batt = analogRead(BATT_PIN) * BATT_SCALE;
 
   Serial.print(F("TEL,"));
   Serial.print(now);         Serial.print(',');
   Serial.print(lc);          Serial.print(',');
   Serial.print(rc);          Serial.print(',');
-  Serial.print(leftRpm, 2);  Serial.print(',');
-  Serial.print(rightRpm, 2); Serial.print(',');
+  Serial.print(leftRpm, 1);  Serial.print(',');
+  Serial.print(rightRpm, 1); Serial.print(',');
   Serial.print(currentLeftPWM);  Serial.print(',');
   Serial.print(currentRightPWM); Serial.print(',');
   Serial.println(batt, 2);
 }
 
-// ── Watchdog ──────────────────────────────────────────────────────────────────
 void checkWatchdog() {
   if (failsafeActive) return;
   if ((currentLeftPWM != 0 || currentRightPWM != 0) &&
@@ -235,7 +215,6 @@ void checkWatchdog() {
   }
 }
 
-// ── Setup / Loop ──────────────────────────────────────────────────────────────
 void setup() {
   pinMode(L_RPWM, OUTPUT); pinMode(L_LPWM, OUTPUT);
   pinMode(L_REN,  OUTPUT); pinMode(L_LEN,  OUTPUT);
@@ -254,7 +233,7 @@ void setup() {
   resetOdometry();
   lastCmdMs = millis();
 
-  Serial.println(F("PONG ARESPATH"));   // auto-announce on reset
+  Serial.println(F("PONG ARESPATH"));
 }
 
 void loop() {

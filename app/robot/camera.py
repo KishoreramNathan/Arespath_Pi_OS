@@ -167,11 +167,14 @@ class CameraManager:
 
     def take_photo(self) -> Dict[str, str]:
         """Capture one frame from every camera and save to photos/.
-        Returns {cam_name: filename} for successfully saved photos."""
+        Returns {cam_name: filename} for successfully saved photos.
+        Skips cameras that only have a placeholder (no real frame yet)."""
         results: Dict[str, str] = {}
         ts = int(time.time())
         for cam_name, worker in self.cams.items():
-            jpeg = worker.get_jpeg()
+            # Only save real frames — skip placeholder-only cameras
+            with worker._lock:
+                jpeg = worker._frame   # None = no real frame captured yet
             if not jpeg:
                 continue
             fname = f"photo_{cam_name}_{ts}.jpg"

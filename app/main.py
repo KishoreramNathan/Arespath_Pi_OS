@@ -1,4 +1,13 @@
-"""Arespath Rover — main Flask application.
+"""Arespath Rover — main Flask application v7.
+
+V7 Navigation Stack (ROS-inspired):
+─────────────────────────────────────
+• Sensor Processing: LiDAR + radar fusion
+• Localization: ICP-corrected odometry
+• Global Planner: Jump Point Search (JPS) with dynamic obstacles
+• Local Planner: Cubic spline smoothing + velocity profiling
+• Controller: Pure pursuit + PID heading control
+• Motor Control: Smooth velocity with acceleration limiting
 
 Routes
 ──────
@@ -68,6 +77,7 @@ socketio = SocketIO(
 
 runtime = RobotRuntime()
 cameras = CameraManager()
+runtime.set_socketio(socketio)
 
 _SPEED_MAP = {
     "forward": (1.0,  0.0),
@@ -78,12 +88,16 @@ _SPEED_MAP = {
 }
 
 
+_startup_lock = __import__('threading').Lock()
+
 @app.before_request
 def _startup_once():
     if not getattr(app, "_started", False):
-        cameras.start()
-        runtime.start()
-        app._started = True
+        with _startup_lock:
+            if not getattr(app, "_started", False):
+                cameras.start()
+                runtime.start()
+                app._started = True
 
 
 # ── Static / SPA ──────────────────────────────────────────────────────────────
@@ -445,4 +459,11 @@ def on_manual_command(data):
 if __name__ == "__main__":
     cameras.start()
     runtime.start()
-    socketio.run(app, host="0.0.0.0", port=config.WEB_PORT, use_reloader=False)
+    app._started = True
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=config.WEB_PORT,
+        use_reloader=False,
+        allow_unsafe_werkzeug=True,
+    )

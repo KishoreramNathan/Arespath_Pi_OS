@@ -63,7 +63,7 @@ class LidarManager:
             points = points[::step]
         return [
             {"x": round(d * math.cos(a), 4), "y": round(d * math.sin(a), 4)}
-            for a, d in points if d > config.LIDAR_MIN_RANGE_M * 0.5
+            for a, d in points
         ]
 
     # ── Background thread ─────────────────────────────────────────────────────
@@ -140,22 +140,22 @@ class LidarManager:
             self._mock_loop()
 
     def _mock_loop(self) -> None:
-        """Emit a full 360° circular mock scan so the UI is exercisable."""
-        log.info("LiDAR mock mode active — full 360° scan")
-        angle_step = 2.0 * math.pi / 720  # 720 points per revolution for high detail
+        """Emit a simple circular mock scan so the UI is exercisable."""
+        log.info("LiDAR mock mode active")
+        angle_step = 2.0 * math.pi / 180
         t = 0.0
         while self._running:
             points: Scan = []
-            for i in range(720):
+            for i in range(180):
                 angle = -math.pi + i * angle_step
-                dist = 2.5 + 0.8 * math.sin(t + angle * 3)
-                dist += 0.4 * math.cos(t * 0.7 + angle * 5)
+                # Vary distance gently to give the radar something to draw
+                dist = 2.5 + 0.8 * math.sin(t + angle * 2)
                 dist = max(config.LIDAR_MIN_RANGE_M, min(config.LIDAR_MAX_RANGE_M, dist))
                 points.append((angle, dist))
             with self._lock:
                 self._scan = points
-            t += 0.1
-            time.sleep(0.10)   # ~10 Hz mock update
+            t += 0.15
+            time.sleep(0.17)   # ~6 Hz mock update
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

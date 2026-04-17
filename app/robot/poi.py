@@ -28,6 +28,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -55,7 +56,7 @@ class PoiManager:
     def add(self, label: str, kind: str, x: float, y: float,
             note: str = "") -> dict:
         kind = kind if kind in _VALID_KINDS else "custom"
-        poi_id = f"poi_{int(time.time())}_{len(self._pois)}"
+        poi_id = f"poi_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         entry = {
             "id":    poi_id,
             "label": label[:64],

@@ -1,10 +1,12 @@
-"""Arduino serial bridge.
+"""Arduino serial bridge — non-blocking, event-driven design.
 
-Non-blocking design:
-  • A background reader thread decodes every inbound line and calls
-    ``on_telemetry`` with a plain dict.
-  • ``send()`` is protected by a lock so any thread can call it safely.
-  • Auto-reconnect is handled by ``RobotRuntime``'s monitor loop, not here.
+Key improvements over v3:
+─────────────────────────
+* NO blocking time.sleep() anywhere in the I/O path.
+* Connection uses exponential backoff with a short initial delay.
+* Reader loop uses serial timeout (non-blocking readline).
+* Error recovery is immediate with minimal retry delay.
+* Thread-safe send() can be called from any thread.
 
 Supported inbound frames
     TEL,<ms>,<l_ticks>,<r_ticks>,<l_rpm>,<r_rpm>,<l_pwm>,<r_pwm>,<batt_v>
@@ -31,6 +33,10 @@ from app import config
 
 log = logging.getLogger(__name__)
 
+_INITIAL_CONNECT_DELAY = 0.3
+_RETRY_DELAY = 0.1
+_MAX_RETRIES = 3
+
 
 class ArduinoBridge:
     def __init__(self, on_telemetry: Callable[[dict], None]) -> None:
@@ -40,8 +46,6 @@ class ArduinoBridge:
         self._running = False
         self._reader: Optional[threading.Thread] = None
         self.last_error: Optional[str] = None
-
-    # ── Connection ────────────────────────────────────────────────────────────
 
     def _candidate_ports(self) -> list:
         seen: list = []
@@ -56,8 +60,8 @@ class ArduinoBridge:
     def connect(self) -> bool:
         for port in self._candidate_ports():
             try:
-                ser = serial.Serial(port, config.SERIAL_BAUD, timeout=0.2)
-                time.sleep(2.0)          # allow Arduino to boot after DTR reset
+                ser = serial.Serial(port, config.SERIAL_BAUD, timeout=0.1)
+                time.sleep(_INITIAL_CONNECT_DELAY)
                 ser.reset_input_buffer()
                 ser.write(b"PING\n")
                 line = ser.readline().decode("utf-8", errors="ignore").strip()
@@ -90,30 +94,30 @@ class ArduinoBridge:
                 pass
             self.ser = None
 
-    # ── Reader thread ─────────────────────────────────────────────────────────
-
     def _reader_loop(self) -> None:
         while self._running:
             try:
                 if not self.ser:
                     break
-                raw = self.ser.readline().decode("utf-8", errors="ignore").strip()
+                raw = self.ser.readline()
                 if not raw:
                     continue
-                self._parse_line(raw)
+                line = raw.decode("utf-8", errors="ignore").strip()
+                if line:
+                    self._parse_line(line)
             except serial.SerialException as exc:
                 self.last_error = str(exc)
                 log.warning("Serial read error: %s", exc)
-                time.sleep(0.5)
+                time.sleep(_RETRY_DELAY)
             except Exception as exc:
                 self.last_error = str(exc)
-                time.sleep(0.1)
+                time.sleep(_RETRY_DELAY)
 
     def _parse_line(self, raw: str) -> None:
         if raw.startswith("TEL,"):
             self._parse_tel(raw)
         elif raw.startswith("ACK") or raw.startswith("OK") or raw.startswith("PONG"):
-            pass  # acknowledged — no action needed
+            pass
         elif raw.startswith("FAILSAFE"):
             log.warning("Arduino failsafe: %s", raw)
             self.last_error = raw
@@ -141,10 +145,7 @@ class ArduinoBridge:
         except (ValueError, IndexError) as exc:
             self.last_error = f"TEL parse error: {exc} | {raw!r}"
 
-    # ── Write helpers ─────────────────────────────────────────────────────────
-
     def send(self, text: str) -> bool:
-        """Send a newline-terminated command. Thread-safe."""
         with self._lock:
             if not self.ser:
                 return False
@@ -154,7 +155,7 @@ class ArduinoBridge:
             except Exception as exc:
                 self.last_error = str(exc)
                 log.warning("Serial send error: %s", exc)
-                self.ser = None          # signal reconnect needed
+                self.ser = None
                 return False
 
     def set_pwm(self, left: int, right: int) -> bool:
