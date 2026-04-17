@@ -55,6 +55,10 @@ class OccupancyGridMap:
         self._scan_gen: int = 0          # incremented on every scan update
         self._png_gen:  int = -1         # generation when PNG was last encoded
         self._png_cache: Optional[str]   = None
+        self._ui_png_gen: int = -1
+        self._ui_png_scale: int = 1
+        self._ui_png_cache: Optional[str] = None
+        self._has_observations: bool = False
         self._lock      = threading.Lock()
 
     # ── Coordinate conversions ───────────────────────────────────────────────
@@ -79,6 +83,11 @@ class OccupancyGridMap:
         with self._lock:
             self.log_odds.fill(0.0)
             self._scan_gen += 1
+            self._has_observations = False
+
+    def has_observations(self) -> bool:
+        with self._lock:
+            return self._has_observations
 
     def update_from_scan(self, pose: Pose, scan: List[Tuple[float, float]]) -> None:
         rx, ry = self.world_to_grid(pose.x, pose.y)
@@ -117,6 +126,7 @@ class OccupancyGridMap:
                     config.LOG_ODDS_MIN,
                     config.LOG_ODDS_MAX,
                 )
+            self._has_observations = True
 
     # ── Bresenham ────────────────────────────────────────────────────────────
 
@@ -188,6 +198,104 @@ class OccupancyGridMap:
                 self._png_cache = png_b64
                 self._png_gen   = current_gen
             return self._png_cache or png_b64
+
+    def _generate_ui_png(self, scale: int = 4) -> str:
+        scale = max(1, int(scale))
+        with self._lock:
+            current_gen = self._scan_gen
+            if (
+                self._ui_png_cache is not None
+                and self._ui_png_gen == current_gen
+                and self._ui_png_scale == scale
+            ):
+                return self._ui_png_cache
+            snap = self.log_odds.copy()
+
+        if scale > 1:
+            h, w = snap.shape
+            ds_h = max(1, h // scale)
+            ds_w = max(1, w // scale)
+            trimmed = snap[: ds_h * scale, : ds_w * scale]
+            reduced = trimmed.reshape(ds_h, scale, ds_w, scale).mean(axis=(1, 3))
+        else:
+            reduced = snap
+
+        img_arr = self._display_image_from_log_odds(reduced)
+        buf = io.BytesIO()
+        Image.fromarray(img_arr).save(buf, format="PNG", optimize=False)
+        png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+        with self._lock:
+            self._ui_png_cache = png_b64
+            self._ui_png_gen = current_gen
+            self._ui_png_scale = scale
+            return self._ui_png_cache
+
+    def localize_scan_match(
+        self,
+        pose: Pose,
+        scan: List[Tuple[float, float]],
+        xy_window_m: float = 0.12,
+        theta_window_rad: float = 0.20,
+        xy_step_m: float = 0.04,
+        theta_step_rad: float = 0.08,
+        stride: int = 6,
+    ) -> Optional[Pose]:
+        if not scan:
+            return None
+
+        with self._lock:
+            if not self._has_observations:
+                return None
+            log_odds = self.log_odds
+
+        best_score = float("-inf")
+        best_pose: Optional[Pose] = None
+        sampled = scan[::max(1, int(stride))]
+
+        x_offsets = np.arange(-xy_window_m, xy_window_m + 1e-6, xy_step_m)
+        y_offsets = np.arange(-xy_window_m, xy_window_m + 1e-6, xy_step_m)
+        t_offsets = np.arange(-theta_window_rad, theta_window_rad + 1e-6, theta_step_rad)
+
+        for dtheta in t_offsets:
+            theta = pose.theta + float(dtheta)
+            cos_t = math.cos(theta)
+            sin_t = math.sin(theta)
+            ray_points = []
+            for angle, dist in sampled:
+                if not (config.LIDAR_MIN_RANGE_M <= dist <= config.LIDAR_MAX_RANGE_M):
+                    continue
+                rx = dist * math.cos(angle)
+                ry = dist * math.sin(angle)
+                ray_points.append((rx, ry, cos_t, sin_t))
+
+            if not ray_points:
+                continue
+
+            for dx in x_offsets:
+                base_x = pose.x + float(dx)
+                for dy in y_offsets:
+                    base_y = pose.y + float(dy)
+                    score = 0.0
+                    hits = 0
+                    for rx, ry, cos_v, sin_v in ray_points:
+                        wx = base_x + cos_v * rx - sin_v * ry
+                        wy = base_y + sin_v * rx + cos_v * ry
+                        gx, gy = self.world_to_grid(wx, wy)
+                        if not self.in_bounds(gx, gy):
+                            continue
+                        val = float(log_odds[gy, gx])
+                        score += val
+                        if val > 0.5:
+                            hits += 1
+                    if hits < 3:
+                        continue
+                    score += hits * 2.0
+                    if score > best_score:
+                        best_score = score
+                        best_pose = Pose(base_x, base_y, theta)
+
+        return best_pose
 
     # ── Planner helpers ───────────────────────────────────────────────────────
 
@@ -270,6 +378,7 @@ class OccupancyGridMap:
         with self._lock:
             self.log_odds = loaded.astype(np.float32)
             self._scan_gen += 1  # force PNG re-encode on next request
+            self._has_observations = True
         log.info("Map loaded: %s", name)
 
     # ── Payload (sent to browser via Socket.IO / REST) ────────────────────────
@@ -280,33 +389,52 @@ class OccupancyGridMap:
         path:    Optional[list]  = None,
         goal:    Optional[Tuple[float, float]] = None,
         scan_px: Optional[list]  = None,
+        render_scale: int = 4,
+        mission_waypoints: Optional[list] = None,
     ) -> dict:
-        png_b64 = self._generate_png()
+        scale = max(1, int(render_scale))
+        png_b64 = self._generate_ui_png(scale=scale)
+
+        render_resolution = self.resolution * scale
+        render_width = max(1, self.size // scale)
+        render_height = max(1, self.size // scale)
 
         pose_px = None
         if pose is not None:
             gx, gy = self.world_to_grid(pose.x, pose.y)
-            pose_px = {"x": gx, "y": gy, "theta": pose.theta}
+            pose_px = {"x": gx / scale, "y": gy / scale, "theta": pose.theta}
 
         path_px = []
         if path:
             for wx, wy in path:
                 gx, gy = self.world_to_grid(wx, wy)
-                path_px.append({"x": gx, "y": gy})
+                path_px.append({"x": gx / scale, "y": gy / scale})
 
         goal_px = None
         if goal is not None:
             gx, gy = self.world_to_grid(goal[0], goal[1])
-            goal_px = {"x": gx, "y": gy}
+            goal_px = {"x": gx / scale, "y": gy / scale}
+
+        mission_px = []
+        if mission_waypoints:
+            for wx, wy in mission_waypoints:
+                gx, gy = self.world_to_grid(wx, wy)
+                mission_px.append({"x": gx / scale, "y": gy / scale})
+
+        scan_scaled = []
+        for pt in scan_px or []:
+            scan_scaled.append({"x": pt["x"] / scale, "y": pt["y"] / scale})
 
         return {
-            "width":         self.size,
-            "height":        self.size,
+            "width":         render_width,
+            "height":        render_height,
             "image_png_b64": png_b64,
             "pose":          pose_px,
             "path":          path_px,
             "goal":          goal_px,
-            "scan":          scan_px or [],
-            "resolution":    self.resolution,
+            "scan":          scan_scaled,
+            "mission_waypoints": mission_px,
+            "resolution":    render_resolution,
             "origin":        [self.origin_x, self.origin_y],
+            "render_scale":  scale,
         }

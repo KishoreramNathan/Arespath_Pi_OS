@@ -27,6 +27,7 @@ const STATE = {
   _pinchDist: null, _pinchMidX: 0, _pinchMidY: 0,
   _pointerMoved: false, _pointerDownX: 0, _pointerDownY: 0,
   pendingPoi: null, pendingGoal: null, mapCentered: false, dragStart: null,
+  pendingMission: [],
   _pois: [],
   _staticImg: null, _staticImgSrc: '', _loadingImgSrc: '', _renderPending: false,
 };
@@ -76,7 +77,7 @@ async function api(path, method='GET', body=null) {
 
 /* ── Socket.IO ───────────────────────────────────────────────────────────── */
 const socket = io({ transports: ['websocket','polling'], reconnectionDelay: 1000 });
-socket.on('connect',    () => { STATE.wsAlive=true;  EL.wsPill.className='pill good'; EL.wsPill.textContent='WS'; });
+socket.on('connect',    () => { STATE.wsAlive=true;  EL.wsPill.className='pill good'; EL.wsPill.textContent='WS'; refreshMap().catch(()=>{}); });
 socket.on('disconnect', () => { STATE.wsAlive=false; EL.wsPill.className='pill bad';  EL.wsPill.textContent='WS'; _stopRepeat(); sendStop(); });
 socket.on('status',     applyStatus);
 socket.on('map_update', (payload) => {
@@ -212,8 +213,9 @@ EL.mapStartBtn.addEventListener('click', () => api('/api/map/start','POST',{clea
 EL.mapStopBtn.addEventListener('click',  () => api('/api/map/stop','POST',{}).catch(()=>{}));
 EL.mapResetBtn.addEventListener('click', () => {
   api('/api/map/reset','POST',{}).catch(()=>{});
-  STATE.mapCentered=false; STATE.pendingGoal=null;
+  STATE.mapCentered=false; STATE.pendingGoal=null; STATE.pendingMission=[];
   STATE._staticImg=null; STATE._staticImgSrc=''; STATE._loadingImgSrc='';
+  updateMissionButton();
   scheduleMapRender();
 });
 EL.saveMapBtn.addEventListener('click', () =>
@@ -223,12 +225,18 @@ EL.loadMapBtn.addEventListener('click', () => {
   if (name) api('/api/map/load','POST',{name}).then(()=>refreshMap()).catch(()=>{});
 });
 EL.startMissionBtn.addEventListener('click', () => {
-  if (!STATE.pendingGoal) { alert('Place a goal on the map first.'); return; }
-  api('/api/navigate/goal','POST',{x:STATE.pendingGoal.x, y:STATE.pendingGoal.y}).catch(()=>{});
+  const waypoints = STATE.pendingMission.length ? STATE.pendingMission : (STATE.pendingGoal ? [STATE.pendingGoal] : []);
+  if (!waypoints.length) { alert('Place one or more mission points on the map first.'); return; }
+  api('/api/navigate/mission','POST',{waypoints}).then(() => {
+    STATE.pendingGoal = null;
+    STATE.pendingMission = [];
+    updateMissionButton();
+    scheduleMapRender();
+  }).catch(()=>{});
 });
 EL.cancelNavBtn.addEventListener('click', () => {
   api('/api/navigate/cancel','POST',{}).catch(()=>{});
-  STATE.pendingGoal=null; scheduleMapRender();
+  STATE.pendingGoal=null; STATE.pendingMission=[]; updateMissionButton(); scheduleMapRender();
 });
 
 /* ── Google-Maps zoom/pan ────────────────────────────────────────────────── */
@@ -353,6 +361,8 @@ EL.mapCanvas.addEventListener('pointerup', e => {
     const pt = canvasToWorld(e.clientX, e.clientY);
     if (STATE.mapTool === 'goal') {
       STATE.pendingGoal = {x: pt.x, y: pt.y};
+      STATE.pendingMission.push(STATE.pendingGoal);
+      updateMissionButton();
       scheduleMapRender();
     } else if (STATE.mapTool === 'start') {
       const start = STATE.dragStart || pt;
@@ -634,14 +644,17 @@ async function refreshMap() {
     if (meta.image_png_b64) _updateStaticImage(meta.image_png_b64);
     if (!STATE.mapCentered && meta.pose) {
       const rect = EL.mapCanvas.getBoundingClientRect();
-      const gpx = (meta.pose.x - meta.origin[0]) / meta.resolution;
-      const gpy = (meta.pose.y - meta.origin[1]) / meta.resolution;
-      STATE.mapPanX = rect.width  / 2 - gpx * STATE.mapZoom;
-      STATE.mapPanY = rect.height / 2 - gpy * STATE.mapZoom;
+      STATE.mapPanX = rect.width  / 2 - meta.pose.x * STATE.mapZoom;
+      STATE.mapPanY = rect.height / 2 - meta.pose.y * STATE.mapZoom;
       STATE.mapCentered = true;
     }
     scheduleMapRender();
   } catch(_) {}
+}
+
+function updateMissionButton() {
+  const count = STATE.pendingMission.length;
+  EL.startMissionBtn.textContent = count > 1 ? `Start Mission (${count})` : 'Start Mission';
 }
 
 /* ── Main map render ─────────────────────────────────────────────────────── */
@@ -748,6 +761,38 @@ function renderMapFrame() {
     mapCtx.stroke(); mapCtx.restore();
   }
 
+  if (STATE.pendingMission?.length) {
+    mapCtx.save();
+    mapCtx.lineWidth=1.5*invZ;
+    mapCtx.strokeStyle='rgba(96,165,250,0.85)';
+    mapCtx.fillStyle='rgba(96,165,250,0.95)';
+    mapCtx.setLineDash([4*invZ,4*invZ]);
+    for (let i=0;i<STATE.pendingMission.length;i++) {
+      const wp = STATE.pendingMission[i];
+      const gx=(wp.x-meta.origin[0])/meta.resolution;
+      const gy=(wp.y-meta.origin[1])/meta.resolution;
+      if (i===0) {
+        mapCtx.beginPath();
+        mapCtx.moveTo(gx,gy);
+      } else {
+        mapCtx.lineTo(gx,gy);
+      }
+    }
+    if (STATE.pendingMission.length > 1) mapCtx.stroke();
+    mapCtx.setLineDash([]);
+    STATE.pendingMission.forEach((wp, idx) => {
+      const gx=(wp.x-meta.origin[0])/meta.resolution;
+      const gy=(wp.y-meta.origin[1])/meta.resolution;
+      mapCtx.beginPath(); mapCtx.arc(gx,gy,5*invZ,0,Math.PI*2); mapCtx.fill();
+      mapCtx.fillStyle='#0f172a';
+      mapCtx.font=`${10*invZ}px sans-serif`;
+      mapCtx.textAlign='center'; mapCtx.textBaseline='middle';
+      mapCtx.fillText(String(idx+1),gx,gy);
+      mapCtx.fillStyle='rgba(96,165,250,0.95)';
+    });
+    mapCtx.restore();
+  }
+
   // Active goal (gold)
   if (meta.goal) {
     const gx=meta.goal.x, gy=meta.goal.y;
@@ -758,6 +803,32 @@ function renderMapFrame() {
     mapCtx.moveTo(gx,gy-10*invZ); mapCtx.lineTo(gx,gy+10*invZ);
     mapCtx.moveTo(gx-10*invZ,gy); mapCtx.lineTo(gx+10*invZ,gy);
     mapCtx.stroke(); mapCtx.restore();
+  }
+
+  if (meta.mission_waypoints?.length) {
+    mapCtx.save();
+    mapCtx.strokeStyle='rgba(251,191,36,0.8)';
+    mapCtx.lineWidth=1.5*invZ;
+    mapCtx.setLineDash([6*invZ,4*invZ]);
+    meta.mission_waypoints.forEach((wp, idx) => {
+      if (idx===0) {
+        mapCtx.beginPath();
+        mapCtx.moveTo(wp.x, wp.y);
+      } else {
+        mapCtx.lineTo(wp.x, wp.y);
+      }
+    });
+    if (meta.mission_waypoints.length > 1) mapCtx.stroke();
+    mapCtx.setLineDash([]);
+    meta.mission_waypoints.forEach((wp, idx) => {
+      mapCtx.fillStyle='rgba(251,191,36,0.92)';
+      mapCtx.beginPath(); mapCtx.arc(wp.x, wp.y, 4.5*invZ, 0, Math.PI*2); mapCtx.fill();
+      mapCtx.fillStyle='#111827';
+      mapCtx.font=`${9*invZ}px sans-serif`;
+      mapCtx.textAlign='center'; mapCtx.textBaseline='middle';
+      mapCtx.fillText(String(idx+1), wp.x, wp.y);
+    });
+    mapCtx.restore();
   }
 
   // POIs
@@ -954,11 +1025,11 @@ function seqLoop(fn,ms){ async function run(){ try{ await fn(); }catch(_){} setT
 /* ── Init ────────────────────────────────────────────────────────────────── */
 _fitCanvas(); scheduleMapRender();
 seqLoop(refreshStatus, 450);
-seqLoop(refreshMap, 2000);
+seqLoop(refreshMap, 8000);
 seqLoop(refreshLidar, 260);
 seqLoop(refreshCameraStatus, 2000);
 seqLoop(refreshPois, 5000);
 refreshMapList(); setInterval(refreshMapList, 10000);
-setTool('goal'); loadTuningSettings();
+setTool('goal'); updateMissionButton(); loadTuningSettings();
 if (typeof ResizeObserver !== 'undefined')
   new ResizeObserver(()=>{ _fitCanvas(); scheduleMapRender(); }).observe(EL.mapOuter);

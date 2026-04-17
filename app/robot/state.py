@@ -32,6 +32,8 @@ class NavigationState:
     active: bool = False
     goal: Optional[Tuple[float, float]] = None
     path: List[Tuple[float, float]] = field(default_factory=list)
+    mission_waypoints: List[Tuple[float, float]] = field(default_factory=list)
+    mission_index: int = 0
     status: str = "idle"
     current_target: Optional[Tuple[float, float]] = None
     last_plan_time: float = 0.0
@@ -41,6 +43,8 @@ class NavigationState:
             "active": self.active,
             "goal": list(self.goal) if self.goal else None,
             "path": [list(p) for p in self.path],
+            "mission_waypoints": [list(p) for p in self.mission_waypoints],
+            "mission_index": self.mission_index,
             "status": self.status,
             "current_target": list(self.current_target) if self.current_target else None,
         }

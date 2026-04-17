@@ -179,6 +179,30 @@ def api_nav_goal():
     return jsonify({"ok": True})
 
 
+@app.route("/api/navigate/mission", methods=["POST"])
+def api_nav_mission():
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "JSON body required"}), 400
+    raw_points = request.json.get("waypoints")
+    if not isinstance(raw_points, list) or not raw_points:
+        return jsonify({"ok": False, "error": "waypoints list required"}), 400
+
+    try:
+        waypoints = [
+            (float(pt["x"]), float(pt["y"]))
+            for pt in raw_points
+            if isinstance(pt, dict)
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    if not waypoints:
+        return jsonify({"ok": False, "error": "no valid waypoints"}), 400
+
+    runtime.set_mission(waypoints)
+    return jsonify({"ok": True, "count": len(waypoints)})
+
+
 @app.route("/api/navigate/cancel", methods=["POST"])
 def api_nav_cancel():
     runtime.cancel_navigation()

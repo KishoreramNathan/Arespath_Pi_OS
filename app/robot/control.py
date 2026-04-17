@@ -120,6 +120,8 @@ class RobotRuntime:
             stop_distance_m=rtcfg.get("obstacle_stop_distance_m"),
             cone_deg=rtcfg.get("obstacle_detection_cone_deg"),
         )
+        self._mission_waypoints: List[Tuple[float, float]] = []
+        self._mission_index: int = 0
 
         self._target_linear: float = 0.0
         self._target_angular: float = 0.0
@@ -242,11 +244,20 @@ class RobotRuntime:
                 self._cancel_nav_locked()
 
     def set_goal(self, x: float, y: float) -> None:
+        self.set_mission([(x, y)])
+
+    def set_mission(self, waypoints: List[Tuple[float, float]]) -> None:
+        clean_waypoints = [(float(x), float(y)) for x, y in waypoints]
+        if not clean_waypoints:
+            return
+
         with self.lock:
             self.state.mode = "mission"
             nav = self.state.nav
             nav.active = True
-            nav.goal = (float(x), float(y))
+            nav.goal = clean_waypoints[0]
+            nav.mission_waypoints = list(clean_waypoints)
+            nav.mission_index = 0
             nav.status = "planning"
             nav.path = []
             nav.current_target = None
@@ -258,8 +269,10 @@ class RobotRuntime:
             self._current_smoothed_path = SmoothedPath()
             self._path_valid = False
             self._trajectory_tracker.reset()
+            self._mission_waypoints = list(clean_waypoints)
+            self._mission_index = 0
 
-        self._submit_plan_request(goal=(x, y))
+        self._submit_plan_request(goal=clean_waypoints[0])
 
     def cancel_navigation(self) -> None:
         with self.lock:
@@ -270,6 +283,8 @@ class RobotRuntime:
         nav.active = False
         nav.goal = None
         nav.path = []
+        nav.mission_waypoints = []
+        nav.mission_index = 0
         nav.current_target = None
         nav.status = "idle"
         self.state.linear_cmd = 0.0
@@ -279,6 +294,8 @@ class RobotRuntime:
         self._current_trajectory = []
         self._current_smoothed_path = SmoothedPath()
         self._path_valid = False
+        self._mission_waypoints = []
+        self._mission_index = 0
         self.queue.push_stop()
 
     def start_mapping(self, clear: bool = False) -> None:
@@ -286,10 +303,14 @@ class RobotRuntime:
             if clear:
                 self.map.clear()
             self.state.mapping = True
+        if clear:
+            self.map_renderer.update_map(self.map.log_odds)
+        self._map_pusher_event.set()
 
     def stop_mapping(self) -> None:
         with self.lock:
             self.state.mapping = False
+        self._map_pusher_event.set()
 
     def clear_map(self) -> None:
         with self.lock:
@@ -297,9 +318,11 @@ class RobotRuntime:
             self.state.nav.path = []
         self.localizer.reset()
         self._planner.update_static_map(self.map.occupancy_for_planner())
+        self.map_renderer.update_map(self.map.log_odds)
         self._replanning_after_obs = False
         self._obstacle_blocked_at = 0.0
         self._obstacle_reverse_until = 0.0
+        self._map_pusher_event.set()
 
     def save_map(self, name: str) -> dict:
         return self.map.save(name)
@@ -308,6 +331,8 @@ class RobotRuntime:
         self.map.load(name)
         self.localizer.reset()
         self._planner.update_static_map(self.map.occupancy_for_planner())
+        self.map_renderer.update_map(self.map.log_odds)
+        self._map_pusher_event.set()
 
     def set_pose(self, x: float, y: float, theta: float) -> None:
         with self.lock:
@@ -412,11 +437,14 @@ class RobotRuntime:
                 self.state.nav.path,
                 self.state.nav.goal,
                 scan_px=scan_px,
+                render_scale=4,
+                mission_waypoints=self._mission_waypoints,
             )
         pois_px = []
+        render_scale = max(1, int(payload.get("render_scale", 1)))
         for poi in self.poi.list():
             gx, gy = self.map.world_to_grid(poi["x"], poi["y"])
-            pois_px.append({**poi, "px": gx, "py": gy})
+            pois_px.append({**poi, "px": gx / render_scale, "py": gy / render_scale})
         payload["pois"] = pois_px
         return payload
 
@@ -585,6 +613,8 @@ class RobotRuntime:
 
                 if config.LIDAR_LOCALIZATION_ENABLED and scan:
                     corrected = self.localizer.correct(self.state.pose, scan)
+                    if self.map.has_observations():
+                        corrected = self.localizer.anchor_to_map(corrected, scan, self.map)
                     with self.lock:
                         self.state.pose.x = corrected.x
                         self.state.pose.y = corrected.y
@@ -676,6 +706,8 @@ class RobotRuntime:
             goal[0] - self.state.pose.x, goal[1] - self.state.pose.y
         )
         if dist_to_goal <= config.GOAL_TOLERANCE_M:
+            if self._advance_mission():
+                return
             self.queue.push_stop()
             self.state.nav.status = "goal reached"
             self.state.nav.active = False
@@ -769,6 +801,33 @@ class RobotRuntime:
 
         lp, rp = self._cmd_to_pwm(self._current_linear, self._current_angular)
         self.queue.push_nav(lp, rp)
+
+    def _advance_mission(self) -> bool:
+        with self.lock:
+            if not self._mission_waypoints:
+                return False
+            next_index = self._mission_index + 1
+            if next_index >= len(self._mission_waypoints):
+                return False
+
+            self._mission_index = next_index
+            next_goal = self._mission_waypoints[next_index]
+            self.state.nav.goal = next_goal
+            self.state.nav.mission_waypoints = list(self._mission_waypoints)
+            self.state.nav.mission_index = next_index
+            self.state.nav.status = f"waypoint {next_index + 1}/{len(self._mission_waypoints)}"
+            self.state.nav.path = []
+            self.state.nav.last_plan_time = 0.0
+            self._current_trajectory = []
+            self._current_smoothed_path = SmoothedPath()
+            self._path_valid = False
+            self._trajectory_tracker.reset()
+            self._obstacle_blocked_at = 0.0
+            self._obstacle_reverse_until = 0.0
+            self._replanning_after_obs = False
+
+        self._submit_plan_request(goal=next_goal)
+        return True
 
     def _smooth_velocity(
         self,

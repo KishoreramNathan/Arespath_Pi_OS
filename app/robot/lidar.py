@@ -224,6 +224,7 @@ class LidarLocalizer:
     def __init__(self) -> None:
         self._ref_cloud: np.ndarray | None = None   # (N,2) xy in world frame
         self._last_run: float = 0.0
+        self._last_map_anchor: float = 0.0
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -258,6 +259,29 @@ class LidarLocalizer:
             theta = wrap_angle(pose.theta + w * dtheta),
         )
         return corrected
+
+    def anchor_to_map(self, pose, current_scan: list, occ_map) -> "Pose":  # type: ignore[name-defined]
+        """Anchor odom+ICP pose to the accumulated occupancy map."""
+        from app import config
+        from app.robot.state import Pose, wrap_angle
+
+        now = time.time()
+        if (now - self._last_map_anchor) < max(config.LIDAR_ICP_INTERVAL_S * 2.0, 0.20):
+            return pose
+        if not current_scan:
+            return pose
+
+        best = occ_map.localize_scan_match(pose, current_scan)
+        self._last_map_anchor = now
+        if best is None:
+            return pose
+
+        w = 0.35
+        return Pose(
+            x=pose.x + (best.x - pose.x) * w,
+            y=pose.y + (best.y - pose.y) * w,
+            theta=wrap_angle(pose.theta + wrap_angle(best.theta - pose.theta) * w),
+        )
 
     def reset(self) -> None:
         """Call when map is cleared or robot is manually relocated."""
