@@ -17,6 +17,9 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+from app import config
+from app.robot.tf import scan_point_to_world
+
 log = logging.getLogger(__name__)
 
 
@@ -70,16 +73,13 @@ class DynamicPlanner:
         if not scan:
             return
 
-        rx, ry, _ = pose
         origin_x, origin_y = grid_origin
 
         for angle, dist in scan:
-            if dist <= 0.12 or dist >= 8.0:
+            if dist <= config.LIDAR_MIN_RANGE_M or dist >= config.LIDAR_MAX_RANGE_M:
                 continue
 
-            global_angle = pose[2] + angle
-            wx = pose[0] + dist * math.cos(global_angle)
-            wy = pose[1] + dist * math.sin(global_angle)
+            wx, wy = scan_point_to_world(pose, angle, dist)
 
             gx = int((wx - origin_x) / self.resolution)
             gy = int((wy - origin_y) / self.resolution)

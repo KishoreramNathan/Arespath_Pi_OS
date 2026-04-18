@@ -41,6 +41,7 @@ from PIL import Image
 
 from app import config
 from app.robot.state import Pose
+from app.robot.tf import lidar_origin_world, scan_point_to_world
 
 log = logging.getLogger(__name__)
 
@@ -91,19 +92,11 @@ class OccupancyGridMap:
 
     @staticmethod
     def lidar_origin_for_pose(pose: Pose) -> Tuple[float, float]:
-        cos_t = math.cos(pose.theta)
-        sin_t = math.sin(pose.theta)
-        lx = pose.x + cos_t * config.LIDAR_OFFSET_X_M - sin_t * config.LIDAR_OFFSET_Y_M
-        ly = pose.y + sin_t * config.LIDAR_OFFSET_X_M + cos_t * config.LIDAR_OFFSET_Y_M
-        return lx, ly
+        return lidar_origin_world(pose)
 
     @staticmethod
     def scan_point_to_world(pose: Pose, angle: float, dist: float) -> Tuple[float, float]:
-        lx, ly = OccupancyGridMap.lidar_origin_for_pose(pose)
-        global_angle = pose.theta + angle
-        wx = lx + dist * math.cos(global_angle)
-        wy = ly + dist * math.sin(global_angle)
-        return wx, wy
+        return scan_point_to_world(pose, angle, dist)
 
     def update_from_scan(self, pose: Pose, scan: List[Tuple[float, float]]) -> None:
         lidar_x, lidar_y = self.lidar_origin_for_pose(pose)
@@ -414,7 +407,7 @@ class OccupancyGridMap:
         path:    Optional[list]  = None,
         goal:    Optional[Tuple[float, float]] = None,
         scan_px: Optional[list]  = None,
-        render_scale: int = 4,
+        render_scale: int = 1,
         mission_waypoints: Optional[list] = None,
     ) -> dict:
         scale = max(1, int(render_scale))

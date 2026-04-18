@@ -1,0 +1,37 @@
+profile:
+  name: large_area_250
+  description: Large-area indoor profile for a 250x250 occupancy grid covering about 10,000 sq ft.
+
+localization_server:
+  ros__parameters:
+    lidar_icp_weight: 0.82
+
+planner_server:
+  ros__parameters:
+    obstacle_stop_distance_m: 0.40
+    obstacle_wait_before_replan_s: 5.0
+    obstacle_replan_reverse_s: 0.8
+    nav_replan_seconds: 0.8
+    path_smoothing_resolution: 0.12
+    max_path_curvature: 1.8
+
+controller_server:
+  ros__parameters:
+    max_linear_mps: 0.35
+    nav_max_acceleration: 0.22
+    nav_max_angular_accel: 1.8
+    trajectory_lookahead_m: 0.60
+    lookahead_min_m: 0.18
+    lookahead_max_m: 0.95
+    lookahead_gain: 0.85
+    kp_angular: 2.4
+    ki_angular: 0.08
+    kd_angular: 0.22
+    kp_linear: 1.0
+
+map_server:
+  ros__parameters:
+    obstacle_detection_cone_deg: 30.0
+    web_map_overlay_interval_s: 0.10
+    map_image_push_interval_s: 0.25
+    web_map_scan_points: 220

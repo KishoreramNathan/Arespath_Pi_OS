@@ -55,6 +55,7 @@ class ApiSmokeTests(unittest.TestCase):
             map_json = map_data.get_json()
             self.assertIn("image_png_b64", map_json)
             self.assertIn("resolution", map_json)
+            self.assertEqual(map_json.get("render_scale"), 1)
         finally:
             runtime.stop()
             cameras.stop()
@@ -62,3 +63,57 @@ class ApiSmokeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalizationRegressionTests(unittest.TestCase):
+    def test_telemetry_lidar_localizer_does_not_double_integrate_odometry(self):
+        from app.robot.lidar_localization import TelemetryLidarLocalizer
+
+        loc = TelemetryLidarLocalizer()
+        pose0 = Pose(0.0, 0.0, 0.0)
+        loc.reset(pose0)
+        first = loc.update(pose0, 0, 0, 1.0, [], OccupancyGridMap())
+        second = loc.update(first.pose, 1320, 1320, 2.0, [], OccupancyGridMap())
+
+        wheel_circ = 2.0 * 3.141592653589793 * config.WHEEL_RADIUS_M
+        expected_ds = wheel_circ * (1320 / config.TICKS_PER_WHEEL_REV)
+        self.assertAlmostEqual(second.pose.x, expected_ds, places=4)
+        self.assertAlmostEqual(second.pose.y, 0.0, places=4)
+        self.assertAlmostEqual(second.pose.theta, 0.0, places=4)
+
+    def test_planner_result_clears_replan_after_obstacle_flag(self):
+        from app.robot.global_planner_node import PlanResult
+        from app.robot.trajectory import SmoothedPath
+
+        runtime = RobotRuntime()
+        try:
+            runtime._running = True
+            runtime._replanning_after_obs = True
+            runtime.state.nav.goal = (1.0, 0.0)
+            result = PlanResult(
+                goal=(1.0, 0.0),
+                path=[(0.0, 0.0), (1.0, 0.0)],
+                trajectory=[],
+                smoothed=SmoothedPath(),
+                stamp=123.0,
+            )
+
+            class _PlannerStub:
+                def __init__(self, res):
+                    self.res = res
+                    self.used = False
+                def get_latest_result(self):
+                    if self.used:
+                        runtime._running = False
+                        return None
+                    self.used = True
+                    return self.res
+                def stop(self):
+                    return None
+
+            runtime.global_planner = _PlannerStub(result)
+            runtime._planner_loop()
+            self.assertFalse(runtime._replanning_after_obs)
+            self.assertTrue(runtime._path_valid)
+        finally:
+            runtime.stop()

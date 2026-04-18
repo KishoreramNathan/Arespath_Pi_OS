@@ -1,162 +1,75 @@
-# Arespath Rover
+# Arespath Rover — V1 Smooth ROS Merge
 
-A full-stack Raspberry Pi robotics control system combining the proven motor control logic from **motor_web_console** with the SLAM architecture of **arespath_slam_enhanced**, rebuilt cleanly from scratch.
+This package upgrades the original V1 rover project with the stronger V2 navigation and mapping stack while keeping the same overall web-console workflow.
 
-## Features
+## What changed
 
-- **Hold-to-drive controls** — D-pad buttons and WASD keys run motors continuously while held; releasing immediately sends STOP
-- **Three fail-safe layers** — Frontend (release/blur), backend queue watchdog, Arduino firmware watchdog (350 ms)
-- **Socket.IO real-time transport** — Manual commands travel over WebSocket; REST is an automatic fallback
-- **20 Hz control loop** — Odometry, mapping, obstacle detection, and navigation at 20 Hz
-- **50 Hz command worker** — DriveCommandQueue serialises commands with priority (manual > nav) and idle watchdog
-- **A\* autonomous navigation** — Click a goal on the map to start a mission; auto-replanning every 1.5 s
-- **Occupancy grid SLAM** — Bayesian log-odds map built from lidar scans
-- **YDLIDAR X2 support** — Real hardware with automatic mock fallback for development
-- **Dual MJPEG camera streams** — OpenCV capture with placeholder frames when hardware is absent
-- **Arduino Uno + BTS7960** — Full encoder odometry, PWM motor control, TEL telemetry frames
+- Correct rover footprint using the V2 chassis values
+  - Rover length: **0.520 m**
+  - Rover width: **0.500 m**
+  - Wheel base / track: **0.400 m**
+- ROS-like navigation flow from V2
+  - ICP-assisted localization
+  - Global planner worker
+  - Local controller node
+  - Smoothed path tracking
+  - Runtime nav profiles
+- Smoother web map behavior from V2
+  - Cached map image rendering
+  - Scaled map fetches for pan/zoom
+  - Better mission overlays and multi-waypoint handling
+- Large-area default mapping setup
+  - **10,000 sq ft** coverage target
+  - **250 × 250** occupancy grid
+  - **0.12192 m/cell** resolution
 
-## Project Structure
+## Project layout
 
 ```
-arespath_rover/
+arespath_v1_smooth_ros/
 ├── app/
-│   ├── main.py              ← Flask + Socket.IO server entry point
-│   ├── config.py            ← All tuneable constants
-│   ├── robot/
-│   │   ├── control.py       ← RobotRuntime (20 Hz loop + monitor)
-│   │   ├── command_bus.py   ← DriveCommandQueue (50 Hz worker)
-│   │   ├── serial_bridge.py ← ArduinoBridge (non-blocking serial)
-│   │   ├── state.py         ← Dataclasses: RobotState, Pose, NavigationState
-│   │   ├── mapping.py       ← OccupancyGridMap (log-odds + Bresenham)
-│   │   ├── planner.py       ← A* path planner + inflate_occupancy
-│   │   ├── lidar.py         ← LidarManager (YDLIDAR X2 + mock)
-│   │   └── camera.py        ← CameraManager (MJPEG + snapshots)
-│   └── static/
-│       ├── index.html       ← Single-page dashboard
-│       ├── app.js           ← Socket.IO client, canvas renders, keyboard
-│       └── styles.css       ← Dark mission-themed UI
 ├── arduino/
-│   └── arespath_final/
-│       └── arespath_final.ino  ← Arduino Uno firmware
+├── config/nav_profiles/
 ├── docs/
-│   └── real_time_control.md   ← Architecture, timing table, code snippets
-├── maps/                    ← Saved occupancy maps (auto-created)
-├── data/                    ← Runtime data (auto-created)
-├── snapshots/               ← Camera snapshots (auto-created)
 ├── services/
-│   └── arespath.service     ← systemd unit for Pi autostart
 ├── scripts/
-│   └── install_pi_os.sh     ← Pi dependency installer
+├── tests/
+├── MERGE_NOTES.md
 └── requirements.txt
 ```
 
-## Quick Start
-
-### 1. Install Python dependencies
+## Start
 
 ```bash
 pip install -r requirements.txt
-```
-
-For camera support:
-```bash
-pip install opencv-python-headless
-```
-
-For real YDLIDAR X2:
-```bash
-# Install ydlidar-sdk from https://github.com/YDLIDAR/YDLidar-SDK
-```
-
-### 2. Flash Arduino
-
-Open `arduino/arespath_final/arespath_final.ino` in Arduino IDE and upload to your Uno.
-
-Verify the serial pinout in the sketch header matches your wiring:
-- Left BTS7960: RPWM=5, LPWM=6, R_EN=7, L_EN=8
-- Right BTS7960: RPWM=9, LPWM=10, R_EN=11, L_EN=12
-- Left encoder: A=2, B=A0
-- Right encoder: A=3, B=A1
-
-### 3. Configure
-
-Edit `app/config.py` for your robot geometry and serial ports:
-
-```python
-WHEEL_RADIUS_M = 0.050        # your wheel radius
-WHEEL_BASE_M   = 0.260        # your wheelbase
-ARDUINO_SERIAL_PORT = "/dev/ttyUSB0"
-LIDAR_SERIAL_PORT   = "/dev/ttyUSB1"
-```
-
-### 4. Run
-
-```bash
 python -m app.main
 ```
 
-Open `http://<pi-ip>:8080` in your browser.
+Then open:
 
-### 5. Autostart on Pi
-
-```bash
-sudo cp services/arespath.service /etc/systemd/system/
-sudo systemctl enable --now arespath
+```
+http://<pi-ip>:8080
 ```
 
-## Driving
+## Mapping defaults
 
-- **Arm first** — click "Arm Motors" before driving
-- **D-pad** — hold a button to drive; release to stop
-- **Keyboard** — hold W/A/S/D to drive; Space = stop; release any key = stop
-- **Speed slider** — sets drive speed percentage (5–100%)
-- **STOP button** — emergency stop, always works without arming
+The default map is centered around the robot start area and sized for a roughly square **100 ft × 100 ft** space:
 
-## Mapping & Navigation
+- `MAP_SIZE_CELLS = 250`
+- `MAP_RESOLUTION_M = 0.12192`
+- `MAP_ORIGIN_X_M = -15.24`
+- `MAP_ORIGIN_Y_M = -15.24`
 
-1. Click **Start Map** to begin building the occupancy grid
-2. Drive the robot around the space
-3. Click **Stop Map** and **Save** when done
-4. Switch to **Mission** mode
-5. Click a point on the map to set a navigation goal
-6. The robot plans an A\* path and drives to the goal
+## Recommended profile
 
-## REST API Reference
+The default runtime navigation profile is:
 
-| Endpoint | Method | Body | Description |
-|----------|--------|------|-------------|
-| `/api/status` | GET | — | Full robot status |
-| `/api/arm` | POST | `{armed}` | Arm/disarm motors |
-| `/api/stop` | POST | — | Emergency stop |
-| `/api/manual` | POST | `{linear, angular}` | Manual drive (-1…1) |
-| `/api/mode` | POST | `{mode}` | pilot / mission |
-| `/api/map/start` | POST | `{clear?}` | Start mapping |
-| `/api/map/stop` | POST | — | Stop mapping |
-| `/api/map/reset` | POST | — | Clear map |
-| `/api/map/save` | POST | `{name}` | Save map |
-| `/api/map/load` | POST | `{name}` | Load map |
-| `/api/map/list` | GET | — | Saved map names |
-| `/api/map/data` | GET | — | Map PNG + overlays |
-| `/api/navigate/goal` | POST | `{x, y}` | Set nav goal |
-| `/api/navigate/cancel` | POST | — | Cancel navigation |
-| `/api/pose` | POST | `{x, y, theta}` | Set robot pose |
-| `/api/lidar` | GET | — | Lidar point cloud |
-| `/video/<cam>` | GET | — | MJPEG stream |
-| `/healthz` | GET | — | Liveness probe |
+- `large_area_250`
 
-## Socket.IO Events
+That profile is tuned for smoother motion and lighter web-map updates on a large indoor map.
 
-| Event (client→server) | Payload | Description |
-|----------------------|---------|-------------|
-| `manual_command` | `{cmd, speed}` | Drive command (hold-to-drive) |
-| `heartbeat` | `{}` | Watchdog reset |
+## Run tests
 
-| Event (server→client) | Payload | Description |
-|----------------------|---------|-------------|
-| `status` | full status dict | On connect |
-| `ack` | `{cmd, ok}` | Command acknowledgement |
-| `heartbeat_ack` | `{ts}` | Heartbeat response |
-
-## Architecture
-
-See [docs/real_time_control.md](docs/real_time_control.md) for the full architecture diagram, timing table, and annotated code snippets.
+```bash
+python -m unittest tests/test_regressions.py
+```

@@ -1,0 +1,37 @@
+profile:
+  name: explore_fast
+  description: Faster exploration profile for larger open areas with lighter UI updates.
+
+localization_server:
+  ros__parameters:
+    lidar_icp_weight: 0.72
+
+planner_server:
+  ros__parameters:
+    obstacle_stop_distance_m: 0.32
+    obstacle_wait_before_replan_s: 4.0
+    obstacle_replan_reverse_s: 0.9
+    nav_replan_seconds: 0.9
+    path_smoothing_resolution: 0.06
+    max_path_curvature: 2.6
+
+controller_server:
+  ros__parameters:
+    max_linear_mps: 0.55
+    nav_max_acceleration: 0.42
+    nav_max_angular_accel: 2.6
+    trajectory_lookahead_m: 0.65
+    lookahead_min_m: 0.18
+    lookahead_max_m: 1.05
+    lookahead_gain: 0.95
+    kp_angular: 2.1
+    ki_angular: 0.08
+    kd_angular: 0.24
+    kp_linear: 0.95
+
+map_server:
+  ros__parameters:
+    obstacle_detection_cone_deg: 22.0
+    web_map_overlay_interval_s: 0.20
+    map_image_push_interval_s: 1.10
+    web_map_scan_points: 80

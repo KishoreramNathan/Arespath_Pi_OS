@@ -15,11 +15,13 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 MAPS_DIR = BASE_DIR / "maps"
 DATA_DIR = BASE_DIR / "data"
+NAV_PROFILES_DIR = BASE_DIR / "config" / "nav_profiles"
 SNAPSHOT_DIR = BASE_DIR / "snapshots"
 PHOTOS_DIR = BASE_DIR / "photos"
 
 MAPS_DIR.mkdir(exist_ok=True, parents=True)
 DATA_DIR.mkdir(exist_ok=True, parents=True)
+NAV_PROFILES_DIR.mkdir(exist_ok=True, parents=True)
 SNAPSHOT_DIR.mkdir(exist_ok=True, parents=True)
 PHOTOS_DIR.mkdir(exist_ok=True, parents=True)
 
@@ -105,17 +107,17 @@ LIDAR_MIN_RANGE_M = 0.12
 LIDAR_MAX_RANGE_M = 8.0
 LIDAR_RENDER_MAX_POINTS = 360
 
-MAP_RESOLUTION_M = 0.02
-MAP_SIZE_CELLS = 2400
-MAP_ORIGIN_X_M = -24.0
-MAP_ORIGIN_Y_M = -24.0
+MAP_RESOLUTION_M = 0.25
+MAP_SIZE_CELLS = 250
+MAP_ORIGIN_X_M = -(MAP_SIZE_CELLS * MAP_RESOLUTION_M) / 2.0
+MAP_ORIGIN_Y_M = -(MAP_SIZE_CELLS * MAP_RESOLUTION_M) / 2.0
 FREE_HIT = -0.5
 OCCUPIED_HIT = 2.0
 LOG_ODDS_MIN = -5.0
 LOG_ODDS_MAX = 5.0
 MAP_OCCUPIED_THRESHOLD = 0.68
 MAP_FREE_THRESHOLD = 0.32
-PLANNER_INFLATION_CELLS = 5
+PLANNER_INFLATION_CELLS = 3
 
 LIDAR_LOCALIZATION_ENABLED = True
 LIDAR_ICP_MAX_ITERATIONS = 50
@@ -127,6 +129,7 @@ LIDAR_ICP_INTERVAL_S = 0.05
 
 POIS_FILE = DATA_DIR / "pois.json"
 RUNTIME_SETTINGS_FILE = DATA_DIR / "runtime_settings.json"
+DEFAULT_NAV_PROFILE = "large_area_250"
 
 WEB_PORT = 8080
 STATUS_POLL_MS = 450

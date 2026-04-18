@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from app import config
+import yaml
 
 log = logging.getLogger(__name__)
 
@@ -181,6 +182,30 @@ TUNABLES: Dict[str, Dict[str, Any]] = {
         "unit":    "1/m",
         "description": "Maximum path curvature for speed limiting",
     },
+    "web_map_overlay_interval_s": {
+        "default": 0.15,
+        "min":     0.05,
+        "max":     1.0,
+        "label":   "Map overlay push",
+        "unit":    "s",
+        "description": "How often the web UI gets pose/path overlay updates",
+    },
+    "map_image_push_interval_s": {
+        "default": 0.75,
+        "min":     0.10,
+        "max":     5.0,
+        "label":   "Map image push",
+        "unit":    "s",
+        "description": "Minimum interval between large occupancy image pushes to the browser",
+    },
+    "web_map_scan_points": {
+        "default": 120,
+        "min":     30,
+        "max":     360,
+        "label":   "Map scan points",
+        "unit":    "pts",
+        "description": "Maximum LiDAR points drawn on the mission map overlay",
+    },
 }
 
 
@@ -190,11 +215,18 @@ class RuntimeCfg:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = threading.Lock()
+        self._profile_name = config.DEFAULT_NAV_PROFILE
         # Start from defaults
         self._vals: Dict[str, float] = {
             k: float(v["default"]) for k, v in TUNABLES.items()
         }
+        had_settings = self._path.exists() and bool(self._path.read_text().strip())
         self._load()
+        if not had_settings:
+            try:
+                self._apply_profile_values(self._profile_name, self._load_profile_values(self._profile_name), persist=False)
+            except Exception as exc:
+                log.warning("RuntimeCfg default profile load failed: %s", exc)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -236,19 +268,94 @@ class RuntimeCfg:
             }
         return result
 
+    def current_profile(self) -> str:
+        with self._lock:
+            return self._profile_name
+
+    def list_profiles(self) -> list:
+        profiles = []
+        for path in sorted(config.NAV_PROFILES_DIR.glob("*.yaml")):
+            entry = {"name": path.stem, "description": "", "keys": []}
+            try:
+                data = yaml.safe_load(path.read_text()) or {}
+                if isinstance(data, dict):
+                    meta = data.get("profile")
+                    if isinstance(meta, dict):
+                        entry["description"] = str(meta.get("description", ""))
+                values = self._extract_profile_values(data)
+                entry["keys"] = sorted(values.keys())
+            except Exception as exc:
+                entry["error"] = str(exc)
+            profiles.append(entry)
+        return profiles
+
+    def apply_profile(self, name: str) -> Dict[str, float]:
+        values = self._load_profile_values(name)
+        return self._apply_profile_values(name, values, persist=True)
+
     def reset_to_defaults(self) -> None:
         """Reset all values to config.py defaults and persist."""
         with self._lock:
             self._vals = {k: float(v["default"]) for k, v in TUNABLES.items()}
+            self._profile_name = config.DEFAULT_NAV_PROFILE
             self._save_locked()
         log.info("RuntimeCfg: reset to defaults")
+
+    def _apply_profile_values(
+        self,
+        name: str,
+        values: Dict[str, float],
+        persist: bool,
+    ) -> Dict[str, float]:
+        stored: Dict[str, float] = {}
+        with self._lock:
+            for key, value in values.items():
+                if key not in TUNABLES:
+                    continue
+                spec = TUNABLES[key]
+                clamped = float(max(spec["min"], min(spec["max"], float(value))))
+                self._vals[key] = clamped
+                stored[key] = clamped
+            self._profile_name = name
+            if persist:
+                self._save_locked()
+        log.info("RuntimeCfg: applied profile %s (%d values)", name, len(stored))
+        return stored
+
+    def _load_profile_values(self, name: str) -> Dict[str, float]:
+        path = config.NAV_PROFILES_DIR / f"{name}.yaml"
+        if not path.exists():
+            raise FileNotFoundError(f"Profile not found: {path}")
+        data = yaml.safe_load(path.read_text()) or {}
+        values = self._extract_profile_values(data)
+        if not values:
+            raise ValueError(f"Profile {name!r} contains no known tunable values")
+        return values
+
+    def _extract_profile_values(self, data: Any) -> Dict[str, float]:
+        values: Dict[str, float] = {}
+
+        def walk(obj: Any) -> None:
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if key in TUNABLES and isinstance(value, (int, float)):
+                        values[key] = float(value)
+                    elif key == "ros__parameters":
+                        walk(value)
+                    elif isinstance(value, dict):
+                        walk(value)
+
+        walk(data)
+        return values
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def _save_locked(self) -> None:
         """Write current values to JSON (must be called with self._lock held)."""
         try:
-            self._path.write_text(json.dumps(self._vals, indent=2))
+            payload = {"_profile": self._profile_name}
+            payload.update(self._vals)
+            self._path.write_text(json.dumps(payload, indent=2))
         except Exception as exc:
             log.error("RuntimeCfg save failed: %s", exc)
 
@@ -262,6 +369,8 @@ class RuntimeCfg:
         try:
             data = json.loads(raw)
             loaded = 0
+            if isinstance(data, dict) and isinstance(data.get("_profile"), str):
+                self._profile_name = data["_profile"]
             for k, v in data.items():
                 if k not in TUNABLES:
                     continue

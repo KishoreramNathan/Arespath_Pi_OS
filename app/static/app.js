@@ -272,19 +272,11 @@ function zoomAt(factor, cx, cy) {
 }
 
 function desiredMapScale() {
-  if (STATE.mapZoom >= 5) return 1;
-  if (STATE.mapZoom >= 2.5) return 2;
-  if (STATE.mapZoom >= 1.2) return 4;
-  return 6;
+  return 1;
 }
 
 function _maybeRefreshMapForZoom() {
-  const scale = desiredMapScale();
-  if (STATE.mapImageScale === scale) return;
-  clearTimeout(STATE._mapRefreshTimer);
-  STATE._mapRefreshTimer = setTimeout(() => {
-    refreshMap().catch(()=>{});
-  }, 120);
+  return;
 }
 
 /* Smooth scroll-to-zoom (mouse wheel + trackpad) */
@@ -428,10 +420,24 @@ function canvasToWorld(clientX, clientY) {
   const cssx = clientX - rect.left;
   const cssy = clientY - rect.top;
   const gridX = (cssx - STATE.mapPanX) / STATE.mapZoom;
-  const gridY = (cssy - STATE.mapPanY) / STATE.mapZoom;
+  const displayY = (cssy - STATE.mapPanY) / STATE.mapZoom;
+  const gridY = meta.height - displayY;
   return {
     x: gridX * meta.resolution + meta.origin[0],
     y: gridY * meta.resolution + meta.origin[1],
+  };
+}
+
+function payloadPointToDisplay(pt, meta = STATE.mapMeta) {
+  if (!meta || !pt) return {x:0, y:0};
+  return { x: pt.x, y: meta.height - pt.y };
+}
+
+function worldToMapDisplay(wx, wy, meta = STATE.mapMeta) {
+  if (!meta) return {x:0, y:0};
+  return {
+    x: (wx - meta.origin[0]) / meta.resolution,
+    y: meta.height - ((wy - meta.origin[1]) / meta.resolution),
   };
 }
 
@@ -614,6 +620,7 @@ function applyStatus(s) {
   const navEl = document.getElementById('st-nav');
   if (navEl) navEl.style.color = navSt.includes('waiting')?'#fbbf24':navSt.includes('replan')?'#f87171':navSt.includes('reached')?'#34d399':'';
   EL.icpPill.className = s.lidar_connected ? 'pill good' : 'pill dim';
+  if (EL.icpPill) EL.icpPill.textContent = s.localization_source || (s.lidar_connected ? 'LiDAR' : 'Loc');
 }
 function _setObstacleCountdown(remaining, total) {
   let ring = document.getElementById('obs-countdown-ring');
@@ -666,8 +673,12 @@ async function refreshMap() {
     if (meta.image_png_b64) _updateStaticImage(meta.image_png_b64);
     if (!STATE.mapCentered && meta.pose) {
       const rect = EL.mapCanvas.getBoundingClientRect();
-      STATE.mapPanX = rect.width  / 2 - meta.pose.x * STATE.mapZoom;
-      STATE.mapPanY = rect.height / 2 - meta.pose.y * STATE.mapZoom;
+      const fitZoom = Math.max(1, Math.min(rect.width / Math.max(1, meta.width || 1), rect.height / Math.max(1, meta.height || 1)));
+      STATE.mapZoom = fitZoom;
+      const posePt = payloadPointToDisplay(meta.pose, meta);
+      STATE.mapPanX = rect.width  / 2 - posePt.x * STATE.mapZoom;
+      STATE.mapPanY = rect.height / 2 - posePt.y * STATE.mapZoom;
+      if (EL.zoomLevel) EL.zoomLevel.textContent = `${STATE.mapZoom.toFixed(1)}×`;
       STATE.mapCentered = true;
     }
     scheduleMapRender();
@@ -708,9 +719,13 @@ function renderMapFrame() {
   // Unified transform: DPR × zoom, pan in CSS pixels × DPR
   mapCtx.setTransform(dpr*z, 0, 0, dpr*z, dpr*STATE.mapPanX, dpr*STATE.mapPanY);
 
-  // Layer 1: static SLAM base
+  // Layer 1: static SLAM base (displayed like ROS map: +Y visually up)
+  mapCtx.imageSmoothingEnabled = false;
   if (STATE._staticImg) {
-    mapCtx.drawImage(STATE._staticImg, 0, 0);
+    mapCtx.save();
+    mapCtx.scale(1, -1);
+    mapCtx.drawImage(STATE._staticImg, 0, -(meta.height || STATE._staticImg.height), meta.width || STATE._staticImg.width, meta.height || STATE._staticImg.height);
+    mapCtx.restore();
   } else {
     mapCtx.fillStyle='#111827'; mapCtx.fillRect(0,0,meta.width||2400,meta.height||2400);
   }
@@ -729,7 +744,10 @@ function renderMapFrame() {
   // Layer 3: live scan dots
   if (meta.scan?.length) {
     mapCtx.fillStyle='rgba(52,211,153,0.65)'; const dot=1.5*invZ;
-    meta.scan.forEach(p=>mapCtx.fillRect(p.x-dot/2,p.y-dot/2,dot,dot));
+    meta.scan.forEach(p=>{
+      const pt = payloadPointToDisplay(p, meta);
+      mapCtx.fillRect(pt.x-dot/2, pt.y-dot/2, dot, dot);
+    });
   }
 
   // Path with velocity-based color gradient (v7: smooth trajectory visualization)
@@ -740,7 +758,7 @@ function renderMapFrame() {
 
     const pathLen=meta.path.length;
     for(let i=1;i<pathLen;i++){
-      const p0=meta.path[i-1], p1=meta.path[i];
+      const p0=payloadPointToDisplay(meta.path[i-1], meta), p1=payloadPointToDisplay(meta.path[i], meta);
       const t=i/pathLen;
       const r=Math.round(56*(1-t)+56*t);
       const g=Math.round(189*(1-t)+100*t);
@@ -758,7 +776,7 @@ function renderMapFrame() {
     // Draw lookahead point indicator
     if(meta.path?.length>3){
       const idx=Math.floor(pathLen*0.3);
-      const lp=meta.path[idx];
+      const lp=payloadPointToDisplay(meta.path[idx], meta);
       mapCtx.fillStyle='rgba(251,191,36,0.8)';
       mapCtx.shadowColor='#fbbf24';
       mapCtx.shadowBlur=8*invZ;
@@ -771,8 +789,7 @@ function renderMapFrame() {
 
   // Pending goal (blue crosshair)
   if (STATE.pendingGoal && meta.origin && meta.resolution) {
-    const gx=(STATE.pendingGoal.x-meta.origin[0])/meta.resolution;
-    const gy=(STATE.pendingGoal.y-meta.origin[1])/meta.resolution;
+    const {x:gx, y:gy} = worldToMapDisplay(STATE.pendingGoal.x, STATE.pendingGoal.y, meta);
     mapCtx.save(); mapCtx.strokeStyle='#60a5fa'; mapCtx.lineWidth=1.5*invZ;
     mapCtx.setLineDash([3*invZ,2*invZ]);
     mapCtx.beginPath(); mapCtx.arc(gx,gy,3*invZ,0,Math.PI*2); mapCtx.stroke();
@@ -791,8 +808,7 @@ function renderMapFrame() {
     mapCtx.setLineDash([4*invZ,4*invZ]);
     for (let i=0;i<STATE.pendingMission.length;i++) {
       const wp = STATE.pendingMission[i];
-      const gx=(wp.x-meta.origin[0])/meta.resolution;
-      const gy=(wp.y-meta.origin[1])/meta.resolution;
+      const {x:gx, y:gy} = worldToMapDisplay(wp.x, wp.y, meta);
       if (i===0) {
         mapCtx.beginPath();
         mapCtx.moveTo(gx,gy);
@@ -803,8 +819,7 @@ function renderMapFrame() {
     if (STATE.pendingMission.length > 1) mapCtx.stroke();
     mapCtx.setLineDash([]);
     STATE.pendingMission.forEach((wp, idx) => {
-      const gx=(wp.x-meta.origin[0])/meta.resolution;
-      const gy=(wp.y-meta.origin[1])/meta.resolution;
+      const {x:gx, y:gy} = worldToMapDisplay(wp.x, wp.y, meta);
       mapCtx.beginPath(); mapCtx.arc(gx,gy,5*invZ,0,Math.PI*2); mapCtx.fill();
       mapCtx.fillStyle='#0f172a';
       mapCtx.font=`${10*invZ}px sans-serif`;
@@ -817,7 +832,7 @@ function renderMapFrame() {
 
   // Active goal (gold)
   if (meta.goal) {
-    const gx=meta.goal.x, gy=meta.goal.y;
+    const {x:gx, y:gy} = payloadPointToDisplay(meta.goal, meta);
     mapCtx.save(); mapCtx.strokeStyle='#fbbf24'; mapCtx.lineWidth=2*invZ;
     mapCtx.shadowColor='#fbbf24'; mapCtx.shadowBlur=6*invZ;
     mapCtx.beginPath(); mapCtx.arc(gx,gy,3.5*invZ,0,Math.PI*2); mapCtx.stroke();
@@ -835,27 +850,30 @@ function renderMapFrame() {
     meta.mission_waypoints.forEach((wp, idx) => {
       if (idx===0) {
         mapCtx.beginPath();
-        mapCtx.moveTo(wp.x, wp.y);
+        const pt = payloadPointToDisplay(wp, meta);
+        mapCtx.moveTo(pt.x, pt.y);
       } else {
-        mapCtx.lineTo(wp.x, wp.y);
+        const pt = payloadPointToDisplay(wp, meta);
+        mapCtx.lineTo(pt.x, pt.y);
       }
     });
     if (meta.mission_waypoints.length > 1) mapCtx.stroke();
     mapCtx.setLineDash([]);
     meta.mission_waypoints.forEach((wp, idx) => {
       mapCtx.fillStyle='rgba(251,191,36,0.92)';
-      mapCtx.beginPath(); mapCtx.arc(wp.x, wp.y, 4.5*invZ, 0, Math.PI*2); mapCtx.fill();
+      const pt = payloadPointToDisplay(wp, meta);
+      mapCtx.beginPath(); mapCtx.arc(pt.x, pt.y, 4.5*invZ, 0, Math.PI*2); mapCtx.fill();
       mapCtx.fillStyle='#111827';
       mapCtx.font=`${9*invZ}px sans-serif`;
       mapCtx.textAlign='center'; mapCtx.textBaseline='middle';
-      mapCtx.fillText(String(idx+1), wp.x, wp.y);
+      mapCtx.fillText(String(idx+1), pt.x, pt.y);
     });
     mapCtx.restore();
   }
 
   // POIs
   (meta.pois||[]).forEach(poi=>{
-    const gx=poi.px, gy=poi.py, r=8*invZ;
+    const {x:gx, y:gy} = payloadPointToDisplay({x: poi.px, y: poi.py}, meta); const r=8*invZ;
     mapCtx.save(); mapCtx.fillStyle='rgba(251,191,36,0.18)';
     mapCtx.beginPath(); mapCtx.arc(gx,gy,r*1.6,0,Math.PI*2); mapCtx.fill();
     mapCtx.strokeStyle='#fbbf24'; mapCtx.lineWidth=1.5*invZ;
@@ -870,10 +888,10 @@ function renderMapFrame() {
 
   // Robot body
   if (meta.pose) {
-    const gx=meta.pose.x, gy=meta.pose.y, th=meta.pose.theta;
+    const {x:gx, y:gy} = payloadPointToDisplay(meta.pose, meta); const th=meta.pose.theta;
     const ppm=1/meta.resolution, rL=0.520/2*ppm, rW=0.500/2*ppm;
     const wheelR=0.120/2*ppm, wheelOffset=0.400/2*ppm, lidarForward=0.240*ppm;
-    mapCtx.save(); mapCtx.translate(gx,gy); mapCtx.rotate(th);
+    mapCtx.save(); mapCtx.translate(gx,gy); mapCtx.rotate(-th);
     mapCtx.fillStyle='rgba(56,189,248,0.12)'; mapCtx.fillRect(-rW,-rL,rW*2,rL*2);
     mapCtx.strokeStyle='rgba(56,189,248,0.52)'; mapCtx.lineWidth=1.5*invZ; mapCtx.strokeRect(-rW,-rL,rW*2,rL*2);
     mapCtx.strokeStyle='#34d399'; mapCtx.lineWidth=2.5*invZ;

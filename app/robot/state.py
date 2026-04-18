@@ -59,6 +59,8 @@ class RobotState:
     lidar_connected: bool = False
     mapping: bool = False
     obstacle_stop: bool = False
+    localization_source: str = "odom"
+    nav_profile: str = "balanced"
 
     pose: Pose = field(default_factory=Pose)
     nav: NavigationState = field(default_factory=NavigationState)
@@ -89,6 +91,8 @@ class RobotState:
             "lidar_connected": self.lidar_connected,
             "mapping": self.mapping,
             "obstacle_stop": self.obstacle_stop,
+            "localization_source": self.localization_source,
+            "nav_profile": self.nav_profile,
             "pose": self.pose.to_dict(),
             "nav": self.nav.to_dict(),
             "left_ticks": self.left_ticks,

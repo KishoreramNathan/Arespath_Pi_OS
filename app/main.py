@@ -359,9 +359,9 @@ def api_map_list():
 @app.route("/api/map/data")
 def api_map_data():
     try:
-        render_scale = int(request.args.get("scale", "4"))
+        render_scale = int(request.args.get("scale", "1"))
     except ValueError:
-        render_scale = 4
+        render_scale = 1
     render_scale = max(1, min(8, render_scale))
     return jsonify(runtime.get_map_payload(render_scale=render_scale))
 

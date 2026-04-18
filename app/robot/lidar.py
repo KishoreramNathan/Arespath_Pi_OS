@@ -23,6 +23,7 @@ from typing import List, Optional, Tuple
 
 from app import config
 from app.robot.messages import RangeScanFrame
+from app.robot.tf import scan_point_to_world
 
 log = logging.getLogger(__name__)
 
@@ -292,21 +293,11 @@ class LidarLocalizer:
     @staticmethod
     def _scan_to_world(scan: list, pose) -> "np.ndarray | None":
         """Convert polar scan to world-frame (N,2) xy array."""
-        from app import config
         if not scan:
             return None
         pts = []
-        cos_t = math.cos(pose.theta)
-        sin_t = math.sin(pose.theta)
-        lidar_x = pose.x + cos_t * config.LIDAR_OFFSET_X_M - sin_t * config.LIDAR_OFFSET_Y_M
-        lidar_y = pose.y + sin_t * config.LIDAR_OFFSET_X_M + cos_t * config.LIDAR_OFFSET_Y_M
         for angle, dist in scan:
-            # robot frame
-            rx = dist * math.cos(angle)
-            ry = dist * math.sin(angle)
-            # world frame
-            wx = lidar_x + cos_t * rx - sin_t * ry
-            wy = lidar_y + sin_t * rx + cos_t * ry
+            wx, wy = scan_point_to_world(pose, angle, dist)
             pts.append((wx, wy))
         return np.array(pts, dtype=np.float32)
 

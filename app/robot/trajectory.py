@@ -243,6 +243,18 @@ class PathSmoother:
             t += dt
             pt.dt = t
 
+    def _compute_path_length(self, trajectory: List[TrajectoryPoint]) -> float:
+        """Compute geometric path length in metres."""
+        if len(trajectory) < 2:
+            return 0.0
+        total = 0.0
+        for i in range(1, len(trajectory)):
+            total += math.hypot(
+                trajectory[i].x - trajectory[i - 1].x,
+                trajectory[i].y - trajectory[i - 1].y,
+            )
+        return total
+
 
 class TrajectoryTracker:
     """Pure pursuit controller with dynamic lookahead and PID heading control."""
