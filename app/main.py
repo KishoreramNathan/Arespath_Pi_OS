@@ -358,7 +358,12 @@ def api_map_list():
 
 @app.route("/api/map/data")
 def api_map_data():
-    return jsonify(runtime.get_map_payload())
+    try:
+        render_scale = int(request.args.get("scale", "4"))
+    except ValueError:
+        render_scale = 4
+    render_scale = max(1, min(8, render_scale))
+    return jsonify(runtime.get_map_payload(render_scale=render_scale))
 
 
 # ── Lidar ─────────────────────────────────────────────────────────────────────

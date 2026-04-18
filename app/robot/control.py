@@ -429,7 +429,7 @@ class RobotRuntime:
             wp3,
         ]
 
-    def get_map_payload(self) -> dict:
+    def get_map_payload(self, render_scale: int = 4) -> dict:
         with self.lock:
             scan_px = self._scan_to_map_pixels(self.lidar.get_scan())
             payload = self.map.map_payload(
@@ -437,7 +437,7 @@ class RobotRuntime:
                 self.state.nav.path,
                 self.state.nav.goal,
                 scan_px=scan_px,
-                render_scale=4,
+                render_scale=render_scale,
                 mission_waypoints=self._mission_waypoints,
             )
         pois_px = []
@@ -457,9 +457,7 @@ class RobotRuntime:
         for angle, dist in scan[::step]:
             if dist <= 0:
                 continue
-            global_angle = pose.theta + angle
-            wx = pose.x + dist * math.cos(global_angle)
-            wy = pose.y + dist * math.sin(global_angle)
+            wx, wy = self.map.scan_point_to_world(pose, angle, dist)
             gx, gy = self.map.world_to_grid(wx, wy)
             if self.map.in_bounds(gx, gy):
                 out.append({"x": gx, "y": gy})

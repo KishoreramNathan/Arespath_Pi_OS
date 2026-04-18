@@ -89,8 +89,25 @@ class OccupancyGridMap:
         with self._lock:
             return self._has_observations
 
+    @staticmethod
+    def lidar_origin_for_pose(pose: Pose) -> Tuple[float, float]:
+        cos_t = math.cos(pose.theta)
+        sin_t = math.sin(pose.theta)
+        lx = pose.x + cos_t * config.LIDAR_OFFSET_X_M - sin_t * config.LIDAR_OFFSET_Y_M
+        ly = pose.y + sin_t * config.LIDAR_OFFSET_X_M + cos_t * config.LIDAR_OFFSET_Y_M
+        return lx, ly
+
+    @staticmethod
+    def scan_point_to_world(pose: Pose, angle: float, dist: float) -> Tuple[float, float]:
+        lx, ly = OccupancyGridMap.lidar_origin_for_pose(pose)
+        global_angle = pose.theta + angle
+        wx = lx + dist * math.cos(global_angle)
+        wy = ly + dist * math.sin(global_angle)
+        return wx, wy
+
     def update_from_scan(self, pose: Pose, scan: List[Tuple[float, float]]) -> None:
-        rx, ry = self.world_to_grid(pose.x, pose.y)
+        lidar_x, lidar_y = self.lidar_origin_for_pose(pose)
+        rx, ry = self.world_to_grid(lidar_x, lidar_y)
         if not self.in_bounds(rx, ry):
             return
 
@@ -98,9 +115,7 @@ class OccupancyGridMap:
         updates_occ:  List[Tuple[int, int]] = []
 
         for angle, dist in scan:
-            global_angle = pose.theta + angle
-            wx = pose.x + dist * math.cos(global_angle)
-            wy = pose.y + dist * math.sin(global_angle)
+            wx, wy = self.scan_point_to_world(pose, angle, dist)
             gx, gy = self.world_to_grid(wx, wy)
             if not self.in_bounds(gx, gy):
                 continue
@@ -279,8 +294,20 @@ class OccupancyGridMap:
                     score = 0.0
                     hits = 0
                     for rx, ry, cos_v, sin_v in ray_points:
-                        wx = base_x + cos_v * rx - sin_v * ry
-                        wy = base_y + sin_v * rx + cos_v * ry
+                        wx = (
+                            base_x
+                            + cos_v * config.LIDAR_OFFSET_X_M
+                            - sin_v * config.LIDAR_OFFSET_Y_M
+                            + cos_v * rx
+                            - sin_v * ry
+                        )
+                        wy = (
+                            base_y
+                            + sin_v * config.LIDAR_OFFSET_X_M
+                            + cos_v * config.LIDAR_OFFSET_Y_M
+                            + sin_v * rx
+                            + cos_v * ry
+                        )
                         gx, gy = self.world_to_grid(wx, wy)
                         if not self.in_bounds(gx, gy):
                             continue
@@ -332,9 +359,7 @@ class OccupancyGridMap:
         for angle, dist in scan[::step]:
             if not (config.LIDAR_MIN_RANGE_M <= dist <= config.LIDAR_MAX_RANGE_M):
                 continue
-            global_angle = pose.theta + angle
-            wx = pose.x + dist * math.cos(global_angle)
-            wy = pose.y + dist * math.sin(global_angle)
+            wx, wy = self.scan_point_to_world(pose, angle, dist)
             gx, gy = self.world_to_grid(wx, wy)
             if self.in_bounds(gx, gy):
                 occupancy[gy, gx] = 1

@@ -28,6 +28,8 @@ const STATE = {
   _pointerMoved: false, _pointerDownX: 0, _pointerDownY: 0,
   pendingPoi: null, pendingGoal: null, mapCentered: false, dragStart: null,
   pendingMission: [],
+  mapImageScale: 4,
+  _mapRefreshTimer: null,
   _pois: [],
   _staticImg: null, _staticImgSrc: '', _loadingImgSrc: '', _renderPending: false,
 };
@@ -245,6 +247,7 @@ EL.mapZoomOutBtn.addEventListener('click',   () => zoomAt(0.77, null, null));
 EL.mapZoomResetBtn.addEventListener('click', () => {
   STATE.mapZoom=1; STATE.mapPanX=0; STATE.mapPanY=0; STATE._panVX=0; STATE._panVY=0;
   if (EL.zoomLevel) EL.zoomLevel.textContent='1.0×';
+  _maybeRefreshMapForZoom();
   scheduleMapRender();
 });
 
@@ -264,7 +267,24 @@ function zoomAt(factor, cx, cy) {
   STATE.mapPanX = mx - worldX * STATE.mapZoom;
   STATE.mapPanY = my - worldY * STATE.mapZoom;
   if (EL.zoomLevel) EL.zoomLevel.textContent = `${STATE.mapZoom.toFixed(1)}×`;
+  _maybeRefreshMapForZoom();
   scheduleMapRender();
+}
+
+function desiredMapScale() {
+  if (STATE.mapZoom >= 5) return 1;
+  if (STATE.mapZoom >= 2.5) return 2;
+  if (STATE.mapZoom >= 1.2) return 4;
+  return 6;
+}
+
+function _maybeRefreshMapForZoom() {
+  const scale = desiredMapScale();
+  if (STATE.mapImageScale === scale) return;
+  clearTimeout(STATE._mapRefreshTimer);
+  STATE._mapRefreshTimer = setTimeout(() => {
+    refreshMap().catch(()=>{});
+  }, 120);
 }
 
 /* Smooth scroll-to-zoom (mouse wheel + trackpad) */
@@ -639,8 +659,10 @@ function _fitCanvas() {
 async function refreshMap() {
   _fitCanvas();
   try {
-    const meta = await api('/api/map/data');
+    const scale = desiredMapScale();
+    const meta = await api(`/api/map/data?scale=${scale}`);
     STATE.mapMeta = meta;
+    STATE.mapImageScale = meta.render_scale || scale;
     if (meta.image_png_b64) _updateStaticImage(meta.image_png_b64);
     if (!STATE.mapCentered && meta.pose) {
       const rect = EL.mapCanvas.getBoundingClientRect();
@@ -850,17 +872,29 @@ function renderMapFrame() {
   if (meta.pose) {
     const gx=meta.pose.x, gy=meta.pose.y, th=meta.pose.theta;
     const ppm=1/meta.resolution, rL=0.520/2*ppm, rW=0.500/2*ppm;
+    const wheelR=0.120/2*ppm, wheelOffset=0.400/2*ppm, lidarForward=0.240*ppm;
     mapCtx.save(); mapCtx.translate(gx,gy); mapCtx.rotate(th);
     mapCtx.fillStyle='rgba(56,189,248,0.12)'; mapCtx.fillRect(-rW,-rL,rW*2,rL*2);
     mapCtx.strokeStyle='rgba(56,189,248,0.52)'; mapCtx.lineWidth=1.5*invZ; mapCtx.strokeRect(-rW,-rL,rW*2,rL*2);
     mapCtx.strokeStyle='#34d399'; mapCtx.lineWidth=2.5*invZ;
     mapCtx.shadowColor='rgba(52,211,153,0.5)'; mapCtx.shadowBlur=6*invZ;
-    mapCtx.beginPath(); mapCtx.moveTo(-rW,rL); mapCtx.lineTo(rW,rL); mapCtx.stroke();
+    mapCtx.beginPath(); mapCtx.moveTo(-rW,-rL); mapCtx.lineTo(rW,-rL); mapCtx.stroke();
+    mapCtx.shadowBlur=0;
+    [['L',-wheelOffset],['R',wheelOffset]].forEach(([_,wx])=>{
+      mapCtx.fillStyle='rgba(100,116,139,0.20)';
+      mapCtx.strokeStyle='rgba(148,163,184,0.70)';
+      mapCtx.lineWidth=1.2*invZ;
+      mapCtx.beginPath(); mapCtx.arc(wx,0,wheelR,0,Math.PI*2); mapCtx.fill(); mapCtx.stroke();
+    });
+    mapCtx.fillStyle='#fbbf24';
+    mapCtx.shadowColor='#fbbf24';
+    mapCtx.shadowBlur=8*invZ;
+    mapCtx.beginPath(); mapCtx.arc(0,-lidarForward,3.2*invZ,0,Math.PI*2); mapCtx.fill();
     mapCtx.shadowBlur=0;
     mapCtx.fillStyle='#38bdf8';
     mapCtx.shadowColor='rgba(56,189,248,0.5)'; mapCtx.shadowBlur=8*invZ;
     const ar=Math.max(3*invZ,rL*0.5);
-    mapCtx.beginPath(); mapCtx.moveTo(0,rL-ar*0.2); mapCtx.lineTo(-ar*0.5,rL-ar); mapCtx.lineTo(ar*0.5,rL-ar);
+    mapCtx.beginPath(); mapCtx.moveTo(0,-rL+ar*0.2); mapCtx.lineTo(-ar*0.5,-rL+ar); mapCtx.lineTo(ar*0.5,-rL+ar);
     mapCtx.closePath(); mapCtx.fill(); mapCtx.restore();
   }
 
